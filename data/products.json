@@ -1,0 +1,74 @@
+[
+  {
+    "id": "gmail_2010_2022",
+    "name": "📧 GMAIL CỔ DATE 2010-2022 (@gmail.com)",
+    "price": 27000,
+    "stock": 69,
+    "image_url": "https://www.gstatic.com/images/branding/product/2x/gmail_2020q4_512dp.png",
+    "description": "🇻🇳 Mô tả: Login lỗi pass - very phone. Được bảo hành 24H.\nĐịnh dạng: Gmail | Pass | Gmail khôi phục.\n- Login số lượng lớn nên cần proxy để tránh bị trùng IP máy.\n- Login xong có nên đổi pass sớm. Hãy thay gmail khôi phục trắng trơn trong trang do lấy được code.\n- Lấy sll ibox admin.",
+    "delivery_text": "GMAIL CỔ DATE 2010-2022 demo | user@example.com | pass-demo | recover@example.com"
+  },
+  {
+    "id": "gmail_200x_2019",
+    "name": "📧 GMAIL CỔ DATE 200X-2019 (@gmail.com)",
+    "price": 32000,
+    "stock": 25,
+    "image_url": "https://www.gstatic.com/images/branding/product/2x/gmail_2020q4_512dp.png",
+    "description": "Gmail cổ date sâu, phù hợp nuôi tài khoản và đăng ký dịch vụ. Bảo hành lỗi đăng nhập trong 24H.",
+    "delivery_text": "GMAIL CỔ DATE 200X-2019 demo | user@example.com | pass-demo"
+  },
+  {
+    "id": "gmail_trial_gemini",
+    "name": "📧 GMAIL CỔ 2010-2016 TRIAL GEMINI YOUTUBE",
+    "price": 45000,
+    "stock": 10,
+    "image_url": "https://www.gstatic.com/images/branding/product/2x/gmail_2020q4_512dp.png",
+    "description": "Gmail cổ phục vụ trial Gemini/Youtube. Shop giao theo định dạng đã công bố.",
+    "delivery_text": "GMAIL TRIAL GEMINI demo | user@example.com | pass-demo"
+  },
+  {
+    "id": "youtube_2020_2024",
+    "name": "▶️ Kênh Youtube 2020-2024",
+    "price": 45000,
+    "stock": 2,
+    "image_url": "https://www.gstatic.com/youtube/img/branding/youtubelogo/svg/youtubelogo.svg",
+    "description": "Kênh Youtube date 2020-2024, giao thông tin đăng nhập sau khi thanh toán.",
+    "delivery_text": "YOUTUBE CHANNEL demo | email@example.com | pass-demo"
+  },
+  {
+    "id": "canva_6m",
+    "name": "🟦 ADD MAIL CANVA PRO BHF 6 Tháng",
+    "price": 60000,
+    "stock": 22,
+    "image_url": "https://static.canva.com/static/images/fb_cover-1.jpg",
+    "description": "Add mail Canva Pro bảo hành theo gói. Vui lòng nhập đúng email cần add khi shop yêu cầu.",
+    "delivery_text": "CANVA PRO 6 THÁNG demo | đã add email"
+  },
+  {
+    "id": "canva_1y",
+    "name": "🟦 ADD MAIL CANVA PRO BHF 1 NĂM",
+    "price": 100000,
+    "stock": 23,
+    "image_url": "https://static.canva.com/static/images/fb_cover-1.jpg",
+    "description": "Add mail Canva Pro 1 năm, phù hợp dùng lâu dài. Bảo hành theo chính sách shop.",
+    "delivery_text": "CANVA PRO 1 NĂM demo | đã add email"
+  },
+  {
+    "id": "capcut_30d",
+    "name": "🎬 CAPCUT PRO 30D BHF",
+    "price": 90000,
+    "stock": 15,
+    "image_url": "https://lf16-web-buz.capcut.com/obj/capcut-web-buz-us/ies/lvweb_os_monorepo/platformSSR/capcut/favicon.ico",
+    "description": "CapCut Pro 30 ngày, giao tài khoản hoặc hướng dẫn kích hoạt theo tồn kho.",
+    "delivery_text": "CAPCUT PRO 30D demo | account@example.com | pass-demo"
+  },
+  {
+    "id": "openart_4k",
+    "name": "♾ OPENART ESSENTIAL 4K CREDIT - [BH 1 NGÀY]",
+    "price": 140000,
+    "stock": 8,
+    "image_url": "https://openart.ai/favicon.ico",
+    "description": "OpenArt Essential 4K credit, bảo hành 1 ngày theo mô tả.",
+    "delivery_text": "OPENART ESSENTIAL demo | account@example.com | pass-demo"
+  }
+]
