@@ -1,5 +1,0 @@
-Bot Telegram đang chạy...
-Web server: http://0.0.0.0:8000
-SePay webhook URL cần đăng ký: https://guidance-consumer-tile-asn.trycloudflare.com/webhook/sepay
-INFO:     171.244.35.2:0 - "POST /webhook/sepay HTTP/1.1" 200 OK
-INFO:     2600:3c15::2000:8aff:fedd:874b:0 - "POST /webhook/sepay HTTP/1.1" 200 OK
