@@ -153,7 +153,7 @@ async def send_shop(message: Message, db: Database) -> None:
 
 async def send_product(message: Message, product: dict[str, Any]) -> None:
     text = render_product_text(product)
-    markup = product_keyboard(product["id"])
+    markup = product_keyboard(product["id"], stock=int(product.get("stock", 0)))
     image_url = (product.get("image_url") or "").strip()
     if image_url:
         try:
@@ -434,6 +434,79 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             )
         except Exception:
             pass
+
+    @router.callback_query(F.data == "admin:delete_product")
+    async def admin_delete_product_start(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        products = await db.get_all_products()
+        if not products:
+            await callback.message.answer("Chưa có sản phẩm nào.", reply_markup=admin_keyboard())
+            await callback.answer()
+            return
+        kb = InlineKeyboardBuilder()
+        for product in products:
+            kb.button(
+                text=f"🗑 {product['name']} | kho {product['stock']}",
+                callback_data=f"admin:del:{product['id']}",
+            )
+        kb.button(text="⬅️ Về admin", callback_data="admin:home")
+        kb.adjust(1)
+        await callback.message.answer(
+            "🗑 <b>Xóa sản phẩm</b>\n"
+            "⚠️ Sản phẩm sẽ bị xóa vĩnh viễn kèm tài khoản trong kho.\n"
+            "Chọn sản phẩm cần xóa:",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:del:"))
+    async def admin_delete_product_confirm(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        product_id = callback.data.rsplit(":", 1)[1]
+        product = await db.get_product(product_id)
+        if not product:
+            # Try get from all products (including hidden)
+            all_products = await db.get_all_products()
+            product = next((p for p in all_products if p["id"] == product_id), None)
+        if not product:
+            await callback.answer("Không tìm thấy sản phẩm.", show_alert=True)
+            return
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Xác nhận xóa", callback_data=f"admin:delconfirm:{product_id}")
+        kb.button(text="❌ Hủy", callback_data="admin:home")
+        kb.adjust(2)
+        await callback.message.answer(
+            f"⚠️ <b>Xác nhận xóa sản phẩm</b>\n\n"
+            f"Sản phẩm: <b>{html_escape(product['name'])}</b>\n"
+            f"Kho: <b>{product.get('stock', 0)}</b>\n\n"
+            f"Thao tác này <b>không thể hoàn tác</b>!",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:delconfirm:"))
+    async def admin_delete_product_execute(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        product_id = callback.data.rsplit(":", 1)[1]
+        success, result = await db.delete_product(product_id)
+        if success:
+            await callback.message.answer(
+                f"✅ <b>{html_escape(result)}</b>",
+                reply_markup=admin_keyboard(),
+            )
+        else:
+            await callback.message.answer(
+                f"❌ {html_escape(result)}",
+                reply_markup=admin_keyboard(),
+            )
+        await callback.answer()
 
     @router.callback_query(F.data == "admin:add_product")
     async def admin_add_product_start(callback: CallbackQuery):
@@ -735,6 +808,31 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         await send_product(callback.message, product)
         await callback.answer()
 
+    @router.callback_query(F.data == "mainmenu")
+    async def mainmenu_callback(callback: CallbackQuery):
+        await callback.message.answer(render_start_text(), reply_markup=start_keyboard())
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("quickbuy:"))
+    async def quickbuy_product(callback: CallbackQuery):
+        parts = callback.data.split(":")
+        if len(parts) != 3:
+            await callback.answer("Lỗi dữ liệu.", show_alert=True)
+            return
+        product_id = parts[1]
+        qty = int(parts[2])
+        product = await db.get_product(product_id)
+        if not product:
+            await callback.answer("Sản phẩm không tồn tại.", show_alert=True)
+            return
+        stock = int(product["stock"])
+        if qty > stock:
+            await callback.answer(f"Không đủ hàng. Tồn kho: {stock}", show_alert=True)
+            return
+        pending_orders[callback.from_user.id] = {"product": product, "qty": qty}
+        await callback.message.answer(render_order_confirm(product, qty), reply_markup=confirm_order_keyboard())
+        await callback.answer()
+
     @router.message(
         lambda message: bool(
             message.from_user
@@ -764,6 +862,7 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             f"Đã bán: <b>{inventory['sold']}</b>",
             reply_markup=admin_keyboard(),
         )
+
 
     @router.callback_query(F.data.startswith("buy:"))
     async def buy_product(callback: CallbackQuery):

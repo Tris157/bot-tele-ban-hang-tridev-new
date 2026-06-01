@@ -738,6 +738,23 @@ class Database:
             status = "Đã hiển thị" if new_active else "Đã ẩn"
             return True, status, product
 
+    async def delete_product(self, product_id: str) -> tuple[bool, str]:
+        """Permanently delete a product and its accounts."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT * FROM products WHERE id = ?",
+                (product_id,),
+            )
+            if not rows:
+                return False, "Sản phẩm không tồn tại."
+
+            product_name = dict(rows[0])["name"]
+            await db.execute("DELETE FROM product_accounts WHERE product_id = ?", (product_id,))
+            await db.execute("DELETE FROM products WHERE id = ?", (product_id,))
+            await db.commit()
+            return True, f"Đã xóa sản phẩm '{product_name}' và tất cả tài khoản liên quan."
+
     async def add_product(
         self,
         *,

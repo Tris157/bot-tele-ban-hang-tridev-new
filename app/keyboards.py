@@ -9,9 +9,8 @@ from app.utils import money_vnd
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🛒 Mua hàng"), KeyboardButton(text="🧿 Lịch sử mua")],
-            [KeyboardButton(text="👛 Ví"), KeyboardButton(text="💬 Hỗ trợ")],
-            [KeyboardButton(text="🔗 API"), KeyboardButton(text="🏠 Menu")],
+            [KeyboardButton(text="🛍 Sản phẩm"), KeyboardButton(text="💬 Hỗ trợ")],
+            [KeyboardButton(text="👛 Ví"), KeyboardButton(text="🔗 API")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -44,11 +43,20 @@ def shop_keyboard(products: list[dict]) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def product_keyboard(product_id: str) -> InlineKeyboardMarkup:
+def product_keyboard(product_id: str, stock: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🛒 Mua sản phẩm này", callback_data=f"buy:{product_id}")
+    # Quick-buy buttons for common quantities
+    quick_qtys = [q for q in [1, 3, 5, 10] if q <= stock]
+    for q in quick_qtys:
+        kb.button(text=f"⚡ Mua {q}x", callback_data=f"quickbuy:{product_id}:{q}")
     kb.button(text="⬅️ Quay lại sản phẩm", callback_data="shop")
-    kb.adjust(1)
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    # Layout: buy button full width, quick-buy in row, then back buttons in row
+    if quick_qtys:
+        kb.adjust(1, len(quick_qtys), 2)
+    else:
+        kb.adjust(1, 2)
     return kb.as_markup()
 
 
@@ -77,6 +85,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="➕ Nạp tài khoản", callback_data="admin:add_accounts")
     kb.button(text="➕ Thêm sản phẩm", callback_data="admin:add_product")
     kb.button(text="🔄 Quản lý sản phẩm", callback_data="admin:manage_products")
+    kb.button(text="🗑 Xóa sản phẩm", callback_data="admin:delete_product")
     kb.button(text="📢 Thông báo sản phẩm mới", callback_data="admin:notify_product")
     kb.button(text="📨 Thông báo riêng", callback_data="admin:notify_private")
     kb.adjust(1)
