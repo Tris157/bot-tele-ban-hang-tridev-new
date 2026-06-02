@@ -64,12 +64,18 @@ class Database:
                     payment_link_id TEXT,
                     checkout_url TEXT,
                     qr_code TEXT,
+                    qr_message_id INTEGER,
                     payment_reference TEXT,
                     created_at TEXT NOT NULL,
                     paid_at TEXT
                 )
                 """
             )
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN qr_message_id INTEGER")
+            except Exception:
+                pass
+
 
             await db.execute(
                 """
@@ -137,6 +143,37 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_product_accounts_product_status ON product_accounts(product_id, status)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_product_accounts_order_code ON product_accounts(order_code)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_order_accounts_order_code ON order_accounts(order_code)")
+
+            # User profiles table for wallet and profile info
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    wallet_balance INTEGER NOT NULL DEFAULT 0,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                )
+                """
+            )
+
+            # API keys table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    api_key TEXT UNIQUE NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY (user_id) REFERENCES user_profiles(user_id)
+                )
+                """
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(api_key)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
 
             await self._backfill_order_items(db)
 
@@ -807,3 +844,190 @@ class Database:
                 """
             )
             return [dict(row) for row in rows]
+
+    # ─── User profile & wallet ───────────────────────────────
+
+    async def get_or_create_profile(
+        self, user_id: int, username: str | None = None, first_name: str | None = None
+    ) -> dict[str, Any]:
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                """
+                INSERT INTO user_profiles (user_id, username, first_name, wallet_balance, first_seen, last_seen)
+                VALUES (?, ?, ?, 0, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = COALESCE(excluded.username, user_profiles.username),
+                    first_name = COALESCE(excluded.first_name, user_profiles.first_name),
+                    last_seen = excluded.last_seen
+                """,
+                (user_id, username, first_name, now, now),
+            )
+            await db.commit()
+            rows = await db.execute_fetchall(
+                "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
+            )
+            return dict(rows[0])
+
+    async def get_user_profile(self, user_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
+            )
+            return dict(rows[0]) if rows else None
+
+    async def get_wallet_balance(self, user_id: int) -> int:
+        profile = await self.get_user_profile(user_id)
+        return int(profile["wallet_balance"]) if profile else 0
+
+    async def deposit_wallet(self, user_id: int, amount: int) -> int:
+        """Add balance. Returns new balance."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute(
+                "UPDATE user_profiles SET wallet_balance = wallet_balance + ? WHERE user_id = ?",
+                (amount, user_id),
+            )
+            await db.commit()
+            rows = await db.execute_fetchall(
+                "SELECT wallet_balance FROM user_profiles WHERE user_id = ?", (user_id,)
+            )
+            return int(rows[0]["wallet_balance"]) if rows else 0
+
+    async def debit_wallet(self, user_id: int, amount: int) -> tuple[bool, int]:
+        """Debit from wallet. Returns (success, new_balance)."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT wallet_balance FROM user_profiles WHERE user_id = ?", (user_id,)
+            )
+            if not rows:
+                return False, 0
+            balance = int(rows[0]["wallet_balance"])
+            if balance < amount:
+                return False, balance
+            new_balance = balance - amount
+            await db.execute(
+                "UPDATE user_profiles SET wallet_balance = ? WHERE user_id = ?",
+                (new_balance, user_id),
+            )
+            await db.commit()
+            return True, new_balance
+
+    async def get_user_order_detail(self, order_code: int, user_id: int) -> dict[str, Any] | None:
+        """Get full order detail for the owning user, including delivered accounts."""
+        order = await self.get_order_by_code(order_code)
+        if not order or int(order["user_id"]) != user_id:
+            return None
+        return order
+
+    async def get_user_stats(self, user_id: int) -> dict[str, Any]:
+        """Get order stats for a user."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT
+                    COUNT(*) as total_orders,
+                    COALESCE(SUM(CASE WHEN status = 'paid' THEN 1 ELSE 0 END), 0) as paid_orders,
+                    COALESCE(SUM(CASE WHEN status = 'paid' THEN total ELSE 0 END), 0) as total_spent
+                FROM orders
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+            row = rows[0]
+            return {
+                "total_orders": int(row["total_orders"]),
+                "paid_orders": int(row["paid_orders"]),
+                "total_spent": int(row["total_spent"]),
+            }
+
+    # ─── API key management ─────────────────────────────────
+
+    async def create_api_key(self, user_id: int) -> str:
+        """Generate and store a new API key for a user. Deactivates old keys."""
+        import secrets
+        api_key = secrets.token_hex(32)  # 64 char hex key
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.path) as db:
+            # Deactivate old keys
+            await db.execute(
+                "UPDATE api_keys SET is_active = 0 WHERE user_id = ?",
+                (user_id,),
+            )
+            await db.execute(
+                """
+                INSERT INTO api_keys (user_id, api_key, created_at, is_active)
+                VALUES (?, ?, ?, 1)
+                """,
+                (user_id, api_key, now),
+            )
+            await db.commit()
+        return api_key
+
+    async def get_user_by_api_key(self, api_key: str) -> dict[str, Any] | None:
+        """Look up user by API key. Returns profile + key info."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT k.user_id, k.api_key, k.created_at as key_created_at,
+                       p.username, p.first_name, p.wallet_balance, p.first_seen
+                FROM api_keys k
+                LEFT JOIN user_profiles p ON p.user_id = k.user_id
+                WHERE k.api_key = ? AND k.is_active = 1
+                """,
+                (api_key,),
+            )
+            if not rows:
+                return None
+            # Update last_used
+            await db.execute(
+                "UPDATE api_keys SET last_used = ? WHERE api_key = ?",
+                (datetime.now().isoformat(timespec="seconds"), api_key),
+            )
+            await db.commit()
+            return dict(rows[0])
+
+    async def get_user_api_key(self, user_id: int) -> str | None:
+        """Get active API key for a user."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT api_key FROM api_keys WHERE user_id = ? AND is_active = 1 ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            )
+            return str(rows[0]["api_key"]) if rows else None
+
+    async def list_user_orders_for_api(self, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+        """Get user orders with items and delivered accounts for API response."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            order_rows = await db.execute_fetchall(
+                """
+                SELECT * FROM orders
+                WHERE user_id = ? AND status = 'paid'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            results = []
+            for row in order_rows:
+                order = dict(row)
+                items = await self._list_order_items(db, int(order["order_code"]))
+                accounts = await self._list_order_accounts(db, int(order["order_code"]))
+                account_texts = [a["account_text"] for a in accounts]
+                for item in items:
+                    results.append({
+                        "id": int(order["order_code"]),
+                        "product": item["name"],
+                        "items": account_texts if account_texts else [item.get("delivery_text", "")],
+                        "price": int(item["price"]) * int(item["qty"]),
+                        "quantity": int(item["qty"]),
+                        "created_at": order.get("created_at", ""),
+                    })
+            return results

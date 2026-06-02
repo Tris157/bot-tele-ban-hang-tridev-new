@@ -18,12 +18,19 @@ from app.keyboards import (
     admin_notify_product_keyboard,
     admin_orders_keyboard,
     admin_product_picker_keyboard,
+    admin_wallet_customers_keyboard,
     confirm_order_keyboard,
     main_menu_keyboard,
+    my_orders_keyboard,
+    order_detail_keyboard,
     payment_keyboard,
     product_keyboard,
+    profile_keyboard,
     shop_keyboard,
     start_keyboard,
+    support_keyboard,
+    wallet_keyboard,
+    SUPPORT_USERNAME,
 )
 from app.sepay_client import SePayClient, SePayError
 from app.utils import html_escape, money_vnd
@@ -33,6 +40,7 @@ router = Router()
 pending_products: dict[int, str] = {}
 pending_orders: dict[int, dict[str, Any]] = {}
 pending_admin_add_accounts: dict[int, str] = {}
+pending_admin_deposit: dict[int, int] = {}  # admin_user_id -> target_customer_id
 
 
 def make_order_code() -> int:
@@ -72,7 +80,7 @@ def render_product_text(product: dict[str, Any]) -> str:
     )
 
 
-def render_order_confirm(product: dict[str, Any], qty: int) -> str:
+def render_order_confirm(product: dict[str, Any], qty: int, *, wallet_balance: int = 0) -> str:
     total = int(product["price"]) * qty
     return (
         "🧾 <b>Xác nhận đơn hàng</b>\n"
@@ -80,7 +88,7 @@ def render_order_confirm(product: dict[str, Any], qty: int) -> str:
         f"Số lượng: <b>{qty}</b>\n"
         f"Thành tiền: <b>{money_vnd(int(product['price']))}</b>\n"
         f"💵 Tổng thanh toán: <b>{money_vnd(total)}</b>\n"
-        "👛 Số dư ví hiện tại: <b>0k</b>\n\n"
+        f"👛 Số dư ví hiện tại: <b>{money_vnd(wallet_balance)}</b>\n\n"
         "Vui lòng chọn phương thức thanh toán:"
     )
 
@@ -167,6 +175,13 @@ async def send_product(message: Message, product: dict[str, Any]) -> None:
 def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings: Settings) -> None:
     @router.message(Command("start"))
     async def start(message: Message):
+        # Create/update user profile
+        await db.get_or_create_profile(
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+        )
+        
         # Notify admin about new user
         user_name = message.from_user.first_name or ""
         user_username = f"@{message.from_user.username}" if message.from_user.username else ""
@@ -194,18 +209,80 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
     @router.message(F.text == "💬 Hỗ trợ")
     async def support_text(message: Message):
         await message.answer(
-            "💬 <b>Hỗ trợ</b>\n"
-            "Bạn nhắn trực tiếp yêu cầu cần hỗ trợ tại đây. Admin sẽ kiểm tra đơn và phản hồi.",
-            reply_markup=main_menu_keyboard(),
+            f"💬 <b>Hỗ trợ</b>\n\n"
+            f"Nếu bạn cần hỗ trợ về đơn hàng, sản phẩm hoặc bất kỳ vấn đề gì, "
+            f"vui lòng liên hệ Admin qua Telegram:\n\n"
+            f"👤 Admin: <b>@{SUPPORT_USERNAME}</b>\n\n"
+            f"Hoặc nhấn nút bên dưới để nhắn tin trực tiếp:",
+            reply_markup=support_keyboard(),
         )
 
     @router.message(F.text == "👛 Ví")
     async def wallet_text(message: Message):
-        await message.answer("👛 <b>Ví của bạn</b>\nSố dư hiện tại: <b>0k</b>")
+        balance = await db.get_wallet_balance(message.from_user.id)
+        await message.answer(
+            f"👛 <b>Ví của bạn</b>\n\n"
+            f"💰 Số dư hiện tại: <b>{money_vnd(balance)}</b>\n\n"
+            f"Bạn có thể nạp tiền vào ví để thanh toán nhanh hơn.",
+            reply_markup=wallet_keyboard(),
+        )
 
     @router.message(F.text == "🔗 API")
     async def api_text(message: Message):
-        await message.answer("🔗 <b>API</b>\nTính năng liên kết API sẽ được shop cấu hình sau.")
+        await message.answer(
+            "🔗 <b>Liên kết API</b>\n\n"
+            f"Tính năng API giúp bạn tích hợp mua hàng tự động.\n"
+            f"Liên hệ Admin @{SUPPORT_USERNAME} để được cấp API key.\n\n"
+            f"📖 Các endpoint hỗ trợ:\n"
+            f"• <code>GET /api/products</code> - Danh sách sản phẩm\n"
+            f"• <code>POST /api/order</code> - Tạo đơn hàng\n"
+            f"• <code>GET /api/order/{{code}}</code> - Kiểm tra đơn",
+            reply_markup=support_keyboard(),
+        )
+
+    @router.message(Command("apikey"))
+    async def apikey_command(message: Message):
+        # Create/update user profile first
+        await db.get_or_create_profile(
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+        )
+        
+        # Check if user already has a key
+        existing_key = await db.get_user_api_key(message.from_user.id)
+        
+        kb = InlineKeyboardBuilder()
+        if existing_key:
+            kb.button(text="🔄 Tạo key mới (hủy key cũ)", callback_data="apikey:regenerate")
+            kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+            kb.adjust(1)
+            await message.answer(
+                f"🔑 <b>API Key của bạn</b>\n\n"
+                f"Key hiện tại:\n<code>{existing_key}</code>\n\n"
+                f"📖 Tài liệu API: <b>{settings.public_base_url}/api/docs</b>\n\n"
+                f"⚠️ Giữ key bí mật, không chia sẻ!",
+                reply_markup=kb.as_markup(),
+            )
+        else:
+            new_key = await db.create_api_key(message.from_user.id)
+            await message.answer(
+                f"✅ <b>API Key đã được tạo!</b>\n\n"
+                f"🔑 Key:\n<code>{new_key}</code>\n\n"
+                f"📖 Tài liệu API (Docs):\n👉 <b>{settings.public_base_url}/api/docs</b>\n\n"
+                f"⚠️ Giữ key bí mật, không chia sẻ!",
+            )
+
+    @router.callback_query(F.data == "apikey:regenerate")
+    async def apikey_regenerate(callback: CallbackQuery):
+        new_key = await db.create_api_key(callback.from_user.id)
+        await callback.message.answer(
+            f"✅ <b>API Key mới đã được tạo!</b>\n\n"
+            f"🔑 Key:\n<code>{new_key}</code>\n\n"
+            f"📖 Tài liệu API (Docs):\n👉 <b>{settings.public_base_url}/api/docs</b>\n\n"
+            f"⚠️ Key cũ đã bị hủy. Giữ key mới bí mật!",
+        )
+        await callback.answer("Đã tạo key mới!")
 
     @router.message(Command("admin"))
     async def admin_home(message: Message):
@@ -289,6 +366,7 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         pending_admin_add_accounts.pop(message.from_user.id, None)
         pending_products.pop(message.from_user.id, None)
         pending_orders.pop(message.from_user.id, None)
+        pending_admin_deposit.pop(message.from_user.id, None)
         await message.answer("Đã hủy thao tác đang chờ.", reply_markup=main_menu_keyboard())
 
     @router.callback_query(F.data == "admin:home")
@@ -789,6 +867,99 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             )
             pending_products.pop(message.from_user.id, None)
 
+    @router.callback_query(F.data == "admin:deposit_wallet")
+    async def admin_deposit_wallet_start(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        customers = await db.get_customers_detailed()
+        if not customers:
+            await callback.message.answer("Chưa có khách hàng nào.", reply_markup=admin_keyboard())
+            await callback.answer()
+            return
+        # Enrich with wallet balance
+        enriched = []
+        for c in customers:
+            profile = await db.get_user_profile(int(c["user_id"]))
+            balance = int(profile["wallet_balance"]) if profile else 0
+            enriched.append({**c, "wallet_balance": balance})
+        await callback.message.answer(
+            "💰 <b>Nạp ví khách hàng</b>\nChọn khách hàng cần nạp ví:",
+            reply_markup=admin_wallet_customers_keyboard(enriched),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:deposit_to:"))
+    async def admin_deposit_to_customer(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        customer_id = int(callback.data.rsplit(":", 1)[1])
+        pending_admin_deposit[callback.from_user.id] = customer_id
+        profile = await db.get_user_profile(customer_id)
+        balance = int(profile["wallet_balance"]) if profile else 0
+        await callback.message.answer(
+            f"💰 <b>Nạp ví cho khách hàng</b>\n\n"
+            f"Khách hàng ID: <code>{customer_id}</code>\n"
+            f"Số dư hiện tại: <b>{money_vnd(balance)}</b>\n\n"
+            "Nhập số tiền cần nạp (VNĐ):\n"
+            "Gửi /cancel để hủy."
+        )
+        await callback.answer()
+
+    @router.message(
+        lambda message: bool(
+            message.from_user
+            and message.text
+            and message.from_user.id in settings.admin_ids
+            and message.from_user.id in pending_admin_deposit
+            and not (message.text or "").startswith("/")
+        )
+    )
+    async def receive_admin_deposit_amount(message: Message):
+        if not message.from_user or not is_admin(message.from_user.id, settings):
+            return
+        customer_id = pending_admin_deposit.get(message.from_user.id)
+        if not customer_id:
+            return
+        
+        text = (message.text or "").strip().replace(".", "").replace(",", "")
+        try:
+            amount = int(text)
+        except ValueError:
+            await message.answer("❌ Số tiền không hợp lệ. Nhập số nguyên (VNĐ).\n\nGửi lại hoặc /cancel để hủy.")
+            return
+        
+        if amount <= 0:
+            await message.answer("❌ Số tiền phải lớn hơn 0.\n\nGửi lại hoặc /cancel để hủy.")
+            return
+        
+        # Ensure profile exists
+        await db.get_or_create_profile(user_id=customer_id)
+        new_balance = await db.deposit_wallet(customer_id, amount)
+        pending_admin_deposit.pop(message.from_user.id, None)
+        
+        await message.answer(
+            f"✅ <b>Đã nạp ví thành công</b>\n\n"
+            f"Khách hàng ID: <code>{customer_id}</code>\n"
+            f"Số tiền nạp: <b>{money_vnd(amount)}</b>\n"
+            f"Số dư mới: <b>{money_vnd(new_balance)}</b>",
+            reply_markup=admin_keyboard(),
+        )
+        
+        # Notify customer
+        try:
+            await message.bot.send_message(
+                customer_id,
+                f"💰 <b>Ví đã được nạp tiền</b>\n\n"
+                f"Số tiền: <b>{money_vnd(amount)}</b>\n"
+                f"Số dư mới: <b>{money_vnd(new_balance)}</b>\n\n"
+                f"Cảm ơn bạn! Bạn có thể dùng ví để thanh toán nhanh.",
+                reply_markup=main_menu_keyboard(),
+            )
+        except Exception:
+            pass
+
     @router.callback_query(F.data == "shop")
     async def shop_callback(callback: CallbackQuery):
         products = await db.list_products()
@@ -830,7 +1001,8 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             await callback.answer(f"Không đủ hàng. Tồn kho: {stock}", show_alert=True)
             return
         pending_orders[callback.from_user.id] = {"product": product, "qty": qty}
-        await callback.message.answer(render_order_confirm(product, qty), reply_markup=confirm_order_keyboard())
+        wallet_balance = await db.get_wallet_balance(callback.from_user.id)
+        await callback.message.answer(render_order_confirm(product, qty, wallet_balance=wallet_balance), reply_markup=confirm_order_keyboard())
         await callback.answer()
 
     @router.message(
@@ -898,11 +1070,107 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
 
         pending_products.pop(user_id, None)
         pending_orders[user_id] = {"product": product, "qty": qty}
-        await message.answer(render_order_confirm(product, qty), reply_markup=confirm_order_keyboard())
+        wallet_balance = await db.get_wallet_balance(user_id)
+        await message.answer(render_order_confirm(product, qty, wallet_balance=wallet_balance), reply_markup=confirm_order_keyboard())
 
     @router.callback_query(F.data == "pay:wallet")
     async def pay_wallet(callback: CallbackQuery):
-        await callback.answer("Ví chưa đủ số dư. Vui lòng chọn Thanh toán ngay.", show_alert=True)
+        pending = pending_orders.get(callback.from_user.id)
+        if not pending:
+            await callback.answer("Không tìm thấy đơn đang chờ. Vui lòng chọn sản phẩm lại.", show_alert=True)
+            return
+        
+        product = pending["product"]
+        qty = int(pending["qty"])
+        total = int(product["price"]) * qty
+        
+        balance = await db.get_wallet_balance(callback.from_user.id)
+        if balance < total:
+            await callback.answer(
+                f"Ví không đủ số dư.\nCần: {money_vnd(total)}\nSố dư: {money_vnd(balance)}\n\nVui lòng nạp thêm hoặc chọn Thanh toán ngay.",
+                show_alert=True,
+            )
+            return
+        
+        latest_product = await db.get_product(product["id"])
+        if not latest_product or qty > int(latest_product["stock"]):
+            await callback.answer("Sản phẩm không đủ tồn kho.", show_alert=True)
+            return
+        account_counts = await db.get_product_account_counts(latest_product["id"])
+        if account_counts["total"] > 0 and qty > account_counts["available"]:
+            await callback.answer("Sản phẩm không đủ tài khoản trong kho.", show_alert=True)
+            return
+
+        # Debit wallet
+        success, new_balance = await db.debit_wallet(callback.from_user.id, total)
+        if not success:
+            await callback.answer(f"Ví không đủ số dư. Số dư hiện tại: {money_vnd(new_balance)}", show_alert=True)
+            return
+        
+        order_code = make_order_code()
+        item = {
+            "id": latest_product["id"],
+            "name": latest_product["name"],
+            "price": int(latest_product["price"]),
+            "qty": qty,
+            "delivery_text": latest_product.get("delivery_text", ""),
+        }
+        await db.create_order(
+            order_code=order_code,
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            items=[item],
+            total=total,
+        )
+        
+        # Auto-mark as paid since wallet was debited
+        reference = f"wallet-{callback.from_user.id}-{order_code}"
+        changed, message_text, paid_order = await db.mark_order_paid(
+            order_code=order_code,
+            amount=total,
+            reference=reference,
+        )
+        
+        pending_orders.pop(callback.from_user.id, None)
+        
+        if changed and paid_order:
+            # Assign accounts
+            assigned, assign_msg, assigned_order = await db.assign_accounts_to_order(order_code)
+            if assigned and assigned_order:
+                paid_order = assigned_order
+            await db.clear_cart(callback.from_user.id)
+            
+            from app.web_app import build_delivery_message
+            await callback.message.answer(build_delivery_message(paid_order))
+            await callback.message.answer(
+                f"👛 Số dư ví còn lại: <b>{money_vnd(new_balance)}</b>",
+                reply_markup=main_menu_keyboard(),
+            )
+            
+            # Notify admin
+            for admin_id in settings.admin_ids:
+                try:
+                    await callback.message.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "💰 <b>Có đơn thanh toán qua Ví</b>\n"
+                            f"Mã đơn: <code>{order_code}</code>\n"
+                            f"Khách: <code>{html_escape(callback.from_user.username or str(callback.from_user.id))}</code>\n"
+                            f"Số tiền: <b>{money_vnd(total)}</b>\n"
+                            f"Giao tài khoản: <b>{html_escape(assign_msg)}</b>"
+                        ),
+                    )
+                except Exception:
+                    pass
+        else:
+            # Shouldn't happen, but refund wallet just in case
+            await db.deposit_wallet(callback.from_user.id, total)
+            await callback.message.answer(
+                "❌ Có lỗi khi xử lý đơn. Tiền đã được hoàn vào ví.",
+                reply_markup=main_menu_keyboard(),
+            )
+        
+        await callback.answer("Thanh toán qua ví thành công!")
 
     @router.callback_query(F.data == "pay:bank")
     async def pay_bank(callback: CallbackQuery):
@@ -974,16 +1242,113 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         await callback.message.answer("🕘 Sau khi chuyển khoản thành công, bot sẽ tự động xác nhận và gửi tài khoản.")
         await callback.answer("Đã tạo QR thanh toán.")
 
-    @router.callback_query(F.data.in_({"profile", "wallet", "support", "api", "language"}))
+    @router.callback_query(F.data.in_({"language"}))
     async def menu_placeholder(callback: CallbackQuery):
-        labels = {
-            "profile": "👤 Hồ sơ",
-            "wallet": "👛 Ví của bạn\nSố dư hiện tại: <b>0k</b>",
-            "support": "💬 Hỗ trợ\nBạn nhắn trực tiếp yêu cầu cần hỗ trợ tại đây.",
-            "api": "🔗 API\nTính năng liên kết API sẽ được shop cấu hình sau.",
-            "language": "🌐 Ngôn ngữ\nHiện bot đang dùng tiếng Việt.",
-        }
-        await callback.message.answer(labels[callback.data])
+        await callback.message.answer(
+            "🌐 <b>Ngôn ngữ</b>\n\n"
+            "Hiện bot đang hỗ trợ <b>Tiếng Việt</b>.\n"
+            "Các ngôn ngữ khác sẽ được cập nhật sau."
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "profile")
+    async def profile_callback(callback: CallbackQuery):
+        profile = await db.get_or_create_profile(
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            first_name=callback.from_user.first_name,
+        )
+        stats = await db.get_user_stats(callback.from_user.id)
+        name = callback.from_user.first_name or ""
+        username = f"@{callback.from_user.username}" if callback.from_user.username else "N/A"
+        
+        await callback.message.answer(
+            f"👤 <b>Hồ sơ của bạn</b>\n\n"
+            f"📛 Tên: <b>{html_escape(name)}</b>\n"
+            f"🆔 Username: <b>{html_escape(username)}</b>\n"
+            f"🔑 User ID: <code>{callback.from_user.id}</code>\n"
+            f"👛 Số dư ví: <b>{money_vnd(int(profile['wallet_balance']))}</b>\n\n"
+            f"📊 <b>Thống kê mua hàng</b>\n"
+            f"• Tổng đơn: <b>{stats['total_orders']}</b>\n"
+            f"• Đơn đã thanh toán: <b>{stats['paid_orders']}</b>\n"
+            f"• Tổng chi tiêu: <b>{money_vnd(stats['total_spent'])}</b>\n\n"
+            f"📅 Tham gia từ: <code>{html_escape(str(profile.get('first_seen', 'N/A')))}</code>",
+            reply_markup=profile_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "wallet")
+    async def wallet_callback(callback: CallbackQuery):
+        balance = await db.get_wallet_balance(callback.from_user.id)
+        await callback.message.answer(
+            f"👛 <b>Ví của bạn</b>\n\n"
+            f"💰 Số dư hiện tại: <b>{money_vnd(balance)}</b>\n\n"
+            f"Bạn có thể nạp tiền vào ví để thanh toán nhanh hơn.",
+            reply_markup=wallet_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "wallet:deposit")
+    async def wallet_deposit_info(callback: CallbackQuery):
+        await callback.message.answer(
+            f"💰 <b>Nạp tiền vào ví</b>\n\n"
+            f"Để nạp tiền vào ví, vui lòng liên hệ Admin:\n"
+            f"👤 <b>@{SUPPORT_USERNAME}</b>\n\n"
+            f"Gửi tin nhắn kèm số tiền muốn nạp, Admin sẽ xác nhận và cộng vào ví cho bạn.",
+            reply_markup=support_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "wallet:history")
+    async def wallet_history(callback: CallbackQuery):
+        orders = await db.list_user_orders(callback.from_user.id, limit=10)
+        paid_orders = [o for o in orders if o["status"] == "paid"]
+        balance = await db.get_wallet_balance(callback.from_user.id)
+        if not paid_orders:
+            await callback.message.answer(
+                f"📋 <b>Lịch sử giao dịch</b>\n\n"
+                f"Chưa có giao dịch nào.\n"
+                f"Số dư hiện tại: <b>{money_vnd(balance)}</b>",
+                reply_markup=wallet_keyboard(),
+            )
+            await callback.answer()
+            return
+        lines = [
+            f"📋 <b>Lịch sử giao dịch</b>",
+            f"Số dư hiện tại: <b>{money_vnd(balance)}</b>",
+            "",
+        ]
+        for order in paid_orders:
+            lines.append(
+                f"• <code>{order['order_code']}</code> | -{money_vnd(int(order['total']))} | {html_escape(str(order.get('paid_at', '')))}"
+            )
+        await callback.message.answer("\n".join(lines), reply_markup=wallet_keyboard())
+        await callback.answer()
+
+    @router.callback_query(F.data == "support")
+    async def support_callback(callback: CallbackQuery):
+        await callback.message.answer(
+            f"💬 <b>Hỗ trợ</b>\n\n"
+            f"Nếu bạn cần hỗ trợ về đơn hàng, sản phẩm hoặc bất kỳ vấn đề gì, "
+            f"vui lòng liên hệ Admin qua Telegram:\n\n"
+            f"👤 Admin: <b>@{SUPPORT_USERNAME}</b>\n\n"
+            f"Hoặc nhấn nút bên dưới để nhắn tin trực tiếp:",
+            reply_markup=support_keyboard(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "api")
+    async def api_callback(callback: CallbackQuery):
+        await callback.message.answer(
+            "🔗 <b>Liên kết API</b>\n\n"
+            f"Tính năng API giúp bạn tích hợp mua hàng tự động.\n"
+            f"Liên hệ Admin @{SUPPORT_USERNAME} để được cấp API key.\n\n"
+            f"📖 Các endpoint hỗ trợ:\n"
+            f"• <code>GET /api/products</code> - Danh sách sản phẩm\n"
+            f"• <code>POST /api/order</code> - Tạo đơn hàng\n"
+            f"• <code>GET /api/order/{{code}}</code> - Kiểm tra đơn",
+            reply_markup=support_keyboard(),
+        )
         await callback.answer()
 
     @router.callback_query(F.data == "myorders")
@@ -991,14 +1356,31 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         await send_my_orders(callback.message, callback.from_user.id)
         await callback.answer()
 
+    @router.callback_query(F.data.startswith("orderdetail:"))
+    async def order_detail_user(callback: CallbackQuery):
+        order_code = int(callback.data.split(":", 1)[1])
+        order = await db.get_user_order_detail(order_code, callback.from_user.id)
+        if not order:
+            await callback.answer("Không tìm thấy đơn hàng.", show_alert=True)
+            return
+        await callback.message.answer(
+            render_order_detail(order),
+            reply_markup=order_detail_keyboard(order_code),
+        )
+        await callback.answer()
+
     @router.callback_query(F.data.startswith("order:"))
     async def check_order(callback: CallbackQuery):
         order_code = int(callback.data.split(":", 1)[1])
-        order = await db.get_order_by_code(order_code)
-        if not order or int(order["user_id"]) != callback.from_user.id:
+        order = await db.get_user_order_detail(order_code, callback.from_user.id)
+        if not order:
             await callback.answer("Không tìm thấy đơn.", show_alert=True)
             return
-        await callback.answer(f"Trạng thái đơn: {order['status']}", show_alert=True)
+        await callback.message.answer(
+            render_order_detail(order),
+            reply_markup=order_detail_keyboard(order_code),
+        )
+        await callback.answer()
 
     @router.message(Command("myorders"))
     async def my_orders(message: Message):
@@ -1007,14 +1389,15 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
     async def send_my_orders(message: Message, user_id: int):
         orders = await db.list_user_orders(user_id, limit=10)
         if not orders:
-            await message.answer("Bạn chưa có đơn hàng nào.")
-            return
-        lines = ["🧿 <b>Lịch sử mua gần đây</b>", ""]
-        for order in orders:
-            lines.append(
-                f"• <code>{order['order_code']}</code> | {money_vnd(int(order['total']))} | <b>{order['status']}</b>"
+            await message.answer(
+                "🧿 <b>Lịch sử mua hàng</b>\n\nBạn chưa có đơn hàng nào.",
+                reply_markup=main_menu_keyboard(),
             )
-        await message.answer("\n".join(lines))
+            return
+        await message.answer(
+            "🧿 <b>Lịch sử mua gần đây</b>\nNhấn vào đơn để xem chi tiết:",
+            reply_markup=my_orders_keyboard(orders),
+        )
 
     @router.message(Command("cart"))
     async def cart_command(message: Message):

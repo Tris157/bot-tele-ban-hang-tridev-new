@@ -5,6 +5,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from app.utils import money_vnd
 
+SUPPORT_USERNAME = "tridev157"
+
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -88,6 +90,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb.button(text="🗑 Xóa sản phẩm", callback_data="admin:delete_product")
     kb.button(text="📢 Thông báo sản phẩm mới", callback_data="admin:notify_product")
     kb.button(text="📨 Thông báo riêng", callback_data="admin:notify_private")
+    kb.button(text="💰 Nạp ví khách hàng", callback_data="admin:deposit_wallet")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -148,6 +151,69 @@ def admin_customers_keyboard(customers: list[dict]) -> InlineKeyboardMarkup:
         kb.button(
             text=f"👤 {username} | {customer['order_count']} đơn | {money_vnd(customer['total_spent'])}",
             callback_data=f"admin:notify_private:{customer['user_id']}",
+        )
+    kb.button(text="⬅️ Về admin", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def support_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"💬 Nhắn tin cho Admin (@{SUPPORT_USERNAME})", url=f"https://t.me/{SUPPORT_USERNAME}")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def wallet_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💰 Nạp tiền vào ví", callback_data="wallet:deposit")
+    kb.button(text="📋 Lịch sử giao dịch", callback_data="wallet:history")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def profile_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧿 Lịch sử mua", callback_data="myorders")
+    kb.button(text="👛 Ví", callback_data="wallet")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def order_detail_keyboard(order_code: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧿 Lịch sử mua", callback_data="myorders")
+    kb.button(text="🛍 Mua tiếp", callback_data="shop")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def my_orders_keyboard(orders: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for order in orders:
+        status_icon = "✅" if order["status"] == "paid" else "⏳"
+        kb.button(
+            text=f"{status_icon} #{order['order_code']} | {money_vnd(int(order['total']))} | {order['status']}",
+            callback_data=f"orderdetail:{order['order_code']}",
+        )
+    kb.button(text="🛍 Mua tiếp", callback_data="shop")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_wallet_customers_keyboard(customers: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for customer in customers:
+        username = customer.get("username") or str(customer["user_id"])
+        balance = customer.get("wallet_balance", 0)
+        kb.button(
+            text=f"👤 {username} | Ví: {money_vnd(balance)}",
+            callback_data=f"admin:deposit_to:{customer['user_id']}",
         )
     kb.button(text="⬅️ Về admin", callback_data="admin:home")
     kb.adjust(1)

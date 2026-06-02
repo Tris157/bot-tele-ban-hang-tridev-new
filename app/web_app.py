@@ -10,6 +10,7 @@ from app.config import Settings
 from app.db import Database
 from app.sepay_client import SePayClient
 from app.utils import html_escape, money_vnd
+from app.api_routes import create_api_router
 
 
 def build_delivery_message(order: dict) -> str:
@@ -53,6 +54,10 @@ def _html_page(title: str, body: str) -> str:
 def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Settings) -> FastAPI:
     app = FastAPI(title="Telegram Shop Bot SePay")
 
+    # Mount API router
+    api_router = create_api_router(bot, db, sepay, settings)
+    app.include_router(api_router)
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         return _html_page(
@@ -61,6 +66,7 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
             <h2>Telegram Shop Bot SePay đang chạy</h2>
             <p>Webhook SePay: <code>/webhook/sepay</code></p>
             <p>Trang QR đơn hàng: <code>/payment/{order_code}</code></p>
+            <p>📖 <a href="/api/docs">API Documentation</a></p>
             """,
         )
 
@@ -185,6 +191,16 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
         if assigned and assigned_order is not None:
             paid_order = assigned_order
         await db.clear_cart(int(paid_order["user_id"]))
+
+        # Gắn user_id khách hàng vào hồ sơ khi thanh toán thành công
+        try:
+            user_id = int(paid_order["user_id"])
+            await db.get_or_create_profile(
+                user_id=user_id,
+                username=paid_order.get("username"),
+            )
+        except Exception as exc:
+            print(f"  [PROFILE] Failed to create profile for user {paid_order['user_id']}: {exc}")
 
         # FIX: Wrap Telegram sends in try/except so a Telegram API error
         # doesn't cause 500 → SePay retry → double processing.
