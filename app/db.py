@@ -1255,6 +1255,18 @@ class Database:
                     })
             return results
 
+    # ── Order Accounts ──────────────────────────────────
+
+    async def get_order_accounts(self, order_code: int) -> list[dict[str, Any]]:
+        """Get all product accounts assigned to an order."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT * FROM product_accounts WHERE order_code = ?",
+                (order_code,),
+            )
+            return [dict(r) for r in rows]
+
     # ── QR Message Tracking ──────────────────────────────
 
     async def save_qr_message_ids(self, order_code: int, qr_msg_id: int, wait_msg_id: int | None = None) -> None:
