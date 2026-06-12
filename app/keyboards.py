@@ -62,8 +62,10 @@ def product_keyboard(product_id: str, stock: int = 0) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def confirm_order_keyboard() -> InlineKeyboardMarkup:
+def confirm_order_keyboard(*, has_coupon: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    if not has_coupon:
+        kb.button(text="🎫 Nhập mã giảm giá", callback_data="coupon:enter")
     kb.button(text="💰 Thanh toán qua ví", callback_data="pay:wallet")
     kb.button(text="🏦 Thanh toán ngay", callback_data="pay:bank")
     kb.adjust(1)
@@ -82,6 +84,9 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📦 Đơn mới nhất", callback_data="admin:orders")
     kb.button(text="📊 Thống kê", callback_data="admin:stats")
+    kb.button(text="🔍 Tìm đơn hàng", callback_data="admin:search")
+    kb.button(text="🎫 Mã giảm giá", callback_data="admin:coupons")
+    kb.button(text="🔄 Bảo hành", callback_data="admin:warranties")
     kb.button(text="🛍 Sản phẩm", callback_data="admin:products")
     kb.button(text="🔐 Kho tài khoản", callback_data="admin:accounts")
     kb.button(text="➕ Nạp tài khoản", callback_data="admin:add_accounts")
@@ -183,12 +188,17 @@ def profile_keyboard() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def order_detail_keyboard(order_code: int) -> InlineKeyboardMarkup:
+def order_detail_keyboard(order_code: int, *, status: str = "") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    if status == "paid":
+        kb.button(text="🔄 Yêu cầu bảo hành", callback_data=f"warranty:request:{order_code}")
     kb.button(text="🧿 Lịch sử mua", callback_data="myorders")
     kb.button(text="🛍 Mua tiếp", callback_data="shop")
     kb.button(text="🏠 Menu chính", callback_data="mainmenu")
-    kb.adjust(2, 1)
+    if status == "paid":
+        kb.adjust(1, 2, 1)
+    else:
+        kb.adjust(2, 1)
     return kb.as_markup()
 
 
@@ -239,3 +249,60 @@ def product_keyboard(product_id: str, stock: int = 0) -> InlineKeyboardMarkup:
     else:
         kb.adjust(1, 2)
     return kb.as_markup()
+
+
+# ── New Keyboards ──────────────────────────────────────
+
+def admin_stats_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Hôm nay", callback_data="stats:today")
+    kb.button(text="📆 Tuần này", callback_data="stats:week")
+    kb.button(text="🗓 Tháng này", callback_data="stats:month")
+    kb.button(text="🏆 Top sản phẩm", callback_data="stats:top_products")
+    kb.button(text="👑 Top khách hàng", callback_data="stats:top_customers")
+    kb.button(text="⬅️ Về admin", callback_data="admin:home")
+    kb.adjust(3, 2, 1)
+    return kb.as_markup()
+
+
+def admin_coupon_keyboard(coupons: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Tạo coupon mới", callback_data="admin:coupon_create")
+    for coupon in coupons:
+        uses = f"{coupon['used_count']}/{coupon['max_uses']}" if coupon.get('max_uses') else f"{coupon['used_count']}/∞"
+        if coupon['discount_type'] == 'percent':
+            discount_text = f"-{coupon['discount_value']}%"
+        else:
+            discount_text = f"-{money_vnd(coupon['discount_value'])}"
+        kb.button(
+            text=f"🎫 {coupon['code']} | {discount_text} | {uses}",
+            callback_data=f"admin:coupon_view:{coupon['id']}",
+        )
+    kb.button(text="⬅️ Về admin", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def admin_warranty_keyboard(warranties: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for w in warranties:
+        status_icon = {"pending": "⏳", "approved": "✅", "rejected": "❌"}.get(w["status"], "❓")
+        kb.button(
+            text=f"{status_icon} #{w['id']} | Đơn #{w['order_code']} | @{w.get('username') or w['user_id']}",
+            callback_data=f"admin:warranty_view:{w['id']}",
+        )
+    kb.button(text="⬅️ Về admin", callback_data="admin:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def language_keyboard(current_lang: str = "vi") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    vi_check = " ✅" if current_lang == "vi" else ""
+    en_check = " ✅" if current_lang == "en" else ""
+    kb.button(text=f"🇻🇳 Tiếng Việt{vi_check}", callback_data="lang:vi")
+    kb.button(text=f"🇬🇧 English{en_check}", callback_data="lang:en")
+    kb.button(text="🏠 Menu chính", callback_data="mainmenu")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+

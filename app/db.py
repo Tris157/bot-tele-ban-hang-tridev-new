@@ -200,6 +200,73 @@ class Database:
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_product_waitlist_product ON product_waitlist(product_id)")
 
+            # Coupons table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coupons (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT UNIQUE NOT NULL,
+                    discount_type TEXT NOT NULL DEFAULT 'percent',
+                    discount_value INTEGER NOT NULL,
+                    max_uses INTEGER DEFAULT NULL,
+                    used_count INTEGER NOT NULL DEFAULT 0,
+                    min_order INTEGER NOT NULL DEFAULT 0,
+                    product_id TEXT DEFAULT NULL,
+                    expires_at TEXT DEFAULT NULL,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (product_id) REFERENCES products(id)
+                )
+                """
+            )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS coupon_uses (
+                    coupon_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    order_code INTEGER NOT NULL,
+                    used_at TEXT NOT NULL,
+                    PRIMARY KEY (coupon_id, user_id, order_code),
+                    FOREIGN KEY (coupon_id) REFERENCES coupons(id),
+                    FOREIGN KEY (order_code) REFERENCES orders(order_code)
+                )
+                """
+            )
+
+            # Warranty requests table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS warranty_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_code INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    account_text TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    new_account_text TEXT,
+                    admin_note TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    FOREIGN KEY (order_code) REFERENCES orders(order_code)
+                )
+                """
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_warranty_user ON warranty_requests(user_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_warranty_status ON warranty_requests(status)")
+
+            # Add language column to user_profiles
+            try:
+                await db.execute("ALTER TABLE user_profiles ADD COLUMN language TEXT DEFAULT 'vi'")
+            except Exception:
+                pass
+
+            # Add wait_message_id column to orders
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN wait_message_id INTEGER")
+            except Exception:
+                pass
+
             await self._backfill_order_items(db)
 
             await db.commit()
@@ -1187,3 +1254,299 @@ class Database:
                         "created_at": order.get("created_at", ""),
                     })
             return results
+
+    # ── QR Message Tracking ──────────────────────────────
+
+    async def save_qr_message_ids(self, order_code: int, qr_msg_id: int, wait_msg_id: int | None = None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE orders SET qr_message_id = ?, wait_message_id = ? WHERE order_code = ?",
+                (qr_msg_id, wait_msg_id, order_code),
+            )
+            await db.commit()
+
+    async def get_qr_message_ids(self, order_code: int) -> dict[str, int | None]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            row = await db.execute_fetchall(
+                "SELECT qr_message_id, wait_message_id, user_id FROM orders WHERE order_code = ?",
+                (order_code,),
+            )
+            if not row:
+                return {"qr_message_id": None, "wait_message_id": None, "user_id": None}
+            r = row[0]
+            return {"qr_message_id": r["qr_message_id"], "wait_message_id": r["wait_message_id"], "user_id": r["user_id"]}
+
+    # ── Coupon System ────────────────────────────────
+
+    async def create_coupon(
+        self,
+        code: str,
+        discount_type: str = "percent",
+        discount_value: int = 10,
+        max_uses: int | None = None,
+        min_order: int = 0,
+        product_id: str | None = None,
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO coupons (code, discount_type, discount_value, max_uses, min_order, product_id, expires_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (code.upper(), discount_type, discount_value, max_uses, min_order, product_id, expires_at, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall("SELECT * FROM coupons WHERE code = ?", (code.upper(),))
+            return dict(rows[0]) if rows else {}
+
+    async def validate_coupon(self, code: str, user_id: int, total: int) -> tuple[bool, str, dict[str, Any] | None]:
+        """Returns (valid, message, coupon_dict)."""
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall("SELECT * FROM coupons WHERE code = ? AND is_active = 1", (code.upper(),))
+            if not rows:
+                return False, "Mã giảm giá không tồn tại hoặc đã hết hiệu lực.", None
+            coupon = dict(rows[0])
+
+            if coupon["expires_at"]:
+                if datetime.fromisoformat(coupon["expires_at"]) < datetime.now():
+                    return False, "Mã giảm giá đã hết hạn.", None
+
+            if coupon["max_uses"] is not None and coupon["used_count"] >= coupon["max_uses"]:
+                return False, "Mã giảm giá đã hết lượt sử dụng.", None
+
+            if total < coupon["min_order"]:
+                from app.utils import money_vnd
+                return False, f"Đơn tối thiểu {money_vnd(coupon['min_order'])} để dùng mã này.", None
+
+            # Check if user already used this coupon
+            used = await db.execute_fetchall(
+                "SELECT 1 FROM coupon_uses WHERE coupon_id = ? AND user_id = ?",
+                (coupon["id"], user_id),
+            )
+            if used:
+                return False, "Bạn đã sử dụng mã giảm giá này rồi.", None
+
+            return True, "OK", coupon
+
+    async def apply_coupon(self, coupon_id: int, user_id: int, order_code: int) -> None:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO coupon_uses (coupon_id, user_id, order_code, used_at) VALUES (?, ?, ?, ?)",
+                (coupon_id, user_id, order_code, now),
+            )
+            await db.execute("UPDATE coupons SET used_count = used_count + 1 WHERE id = ?", (coupon_id,))
+            await db.commit()
+
+    async def list_coupons(self, active_only: bool = True) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if active_only:
+                rows = await db.execute_fetchall("SELECT * FROM coupons WHERE is_active = 1 ORDER BY created_at DESC")
+            else:
+                rows = await db.execute_fetchall("SELECT * FROM coupons ORDER BY created_at DESC")
+            return [dict(r) for r in rows]
+
+    async def delete_coupon(self, coupon_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("UPDATE coupons SET is_active = 0 WHERE id = ?", (coupon_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    # ── Advanced Statistics ──────────────────────────
+
+    async def get_revenue_stats(self, period: str = "today") -> dict[str, Any]:
+        now = datetime.now()
+        if period == "today":
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif period == "week":
+            start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        elif period == "month":
+            start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        else:
+            start = "2000-01-01"
+
+        async with aiosqlite.connect(self.path) as db:
+            row = await db.execute_fetchall(
+                "SELECT COALESCE(SUM(total), 0), COUNT(*) FROM orders WHERE status = 'paid' AND paid_at >= ?",
+                (start,),
+            )
+            revenue, paid_count = row[0] if row else (0, 0)
+
+            row2 = await db.execute_fetchall(
+                "SELECT COUNT(*) FROM orders WHERE status = 'pending' AND created_at >= ?",
+                (start,),
+            )
+            pending_count = row2[0][0] if row2 else 0
+
+            row3 = await db.execute_fetchall(
+                "SELECT COUNT(DISTINCT user_id) FROM orders WHERE created_at >= ?",
+                (start,),
+            )
+            unique_customers = row3[0][0] if row3 else 0
+
+            return {
+                "revenue": int(revenue),
+                "paid_orders": int(paid_count),
+                "pending_orders": int(pending_count),
+                "unique_customers": int(unique_customers),
+                "period": period,
+            }
+
+    async def get_top_products(self, limit: int = 5) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT oi.product_name, SUM(oi.qty) as total_qty, SUM(oi.price * oi.qty) as total_revenue
+                FROM order_items oi
+                JOIN orders o ON o.order_code = oi.order_code
+                WHERE o.status = 'paid'
+                GROUP BY oi.product_id
+                ORDER BY total_qty DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(r) for r in rows]
+
+    async def get_top_customers(self, limit: int = 5) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT user_id, username, COUNT(*) as order_count, SUM(total) as total_spent
+                FROM orders
+                WHERE status = 'paid'
+                GROUP BY user_id
+                ORDER BY total_spent DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [dict(r) for r in rows]
+
+    # ── Order Search ─────────────────────────────────
+
+    async def search_orders(self, keyword: str, limit: int = 10) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            # Try exact order_code match first
+            if keyword.isdigit():
+                rows = await db.execute_fetchall(
+                    "SELECT * FROM orders WHERE order_code = ? LIMIT 1",
+                    (int(keyword),),
+                )
+                if rows:
+                    return [dict(r) for r in rows]
+
+            # Search by username or payment_link_id
+            pattern = f"%{keyword}%"
+            rows = await db.execute_fetchall(
+                """
+                SELECT * FROM orders
+                WHERE username LIKE ? OR payment_link_id LIKE ? OR CAST(user_id AS TEXT) LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (pattern, pattern, pattern, limit),
+            )
+            return [dict(r) for r in rows]
+
+    # ── Warranty System ──────────────────────────────
+
+    async def create_warranty(
+        self,
+        order_code: int,
+        user_id: int,
+        username: str | None,
+        account_text: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO warranty_requests (order_code, user_id, username, account_text, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (order_code, user_id, username, account_text, reason, now),
+            )
+            await db.commit()
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall("SELECT * FROM warranty_requests WHERE id = ?", (cursor.lastrowid,))
+            return dict(rows[0]) if rows else {}
+
+    async def list_warranties(self, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                rows = await db.execute_fetchall(
+                    "SELECT * FROM warranty_requests WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                )
+            else:
+                rows = await db.execute_fetchall(
+                    "SELECT * FROM warranty_requests ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                )
+            return [dict(r) for r in rows]
+
+    async def approve_warranty(self, warranty_id: int, new_account_text: str, admin_note: str = "") -> bool:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE warranty_requests
+                SET status = 'approved', new_account_text = ?, admin_note = ?, resolved_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (new_account_text, admin_note, now, warranty_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def reject_warranty(self, warranty_id: int, admin_note: str = "") -> bool:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                UPDATE warranty_requests
+                SET status = 'rejected', admin_note = ?, resolved_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (admin_note, now, warranty_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def get_warranty(self, warranty_id: int) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall("SELECT * FROM warranty_requests WHERE id = ?", (warranty_id,))
+            return dict(rows[0]) if rows else None
+
+    # ── Language ─────────────────────────────────────
+
+    async def set_language(self, user_id: int, lang: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE user_profiles SET language = ? WHERE user_id = ?",
+                (lang, user_id),
+            )
+            await db.commit()
+
+    async def get_language(self, user_id: int) -> str:
+        async with aiosqlite.connect(self.path) as db:
+            rows = await db.execute_fetchall(
+                "SELECT language FROM user_profiles WHERE user_id = ?",
+                (user_id,),
+            )
+            if rows and rows[0][0]:
+                return rows[0][0]
+            return "vi"

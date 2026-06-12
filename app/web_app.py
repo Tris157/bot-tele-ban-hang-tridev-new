@@ -224,6 +224,25 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
 
         # CRITICAL FIX: Wrap Telegram sends in try/except so a Telegram API error
         # doesn't cause 500 → SePay retry → double processing.
+
+        # Delete QR code + waiting messages (cleanup)
+        try:
+            qr_info = await db.get_qr_message_ids(int(paid_order["order_code"]))
+            chat_id = int(paid_order["user_id"])
+            if qr_info.get("qr_message_id"):
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=qr_info["qr_message_id"])
+                except Exception:
+                    pass
+            if qr_info.get("wait_message_id"):
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=qr_info["wait_message_id"])
+                except Exception:
+                    pass
+            print(f"  [CLEANUP] QR messages deleted for order {paid_order['order_code']}")
+        except Exception as exc:
+            print(f"  [CLEANUP] Failed to delete QR messages: {exc}")
+
         try:
             await bot.send_message(
                 chat_id=int(paid_order["user_id"]),

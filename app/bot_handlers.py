@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from typing import Any
 
@@ -12,13 +13,17 @@ from app.config import Settings
 from app.db import Database
 from app.keyboards import (
     admin_keyboard,
+    admin_coupon_keyboard,
     admin_customers_keyboard,
     admin_manage_products_keyboard,
     admin_notify_product_keyboard,
     admin_orders_keyboard,
     admin_product_picker_keyboard,
+    admin_stats_keyboard,
     admin_wallet_customers_keyboard,
+    admin_warranty_keyboard,
     confirm_order_keyboard,
+    language_keyboard,
     main_menu_keyboard,
     my_orders_keyboard,
     order_detail_keyboard,
@@ -40,6 +45,10 @@ pending_products: dict[int, str] = {}
 pending_orders: dict[int, dict[str, Any]] = {}
 pending_admin_add_accounts: dict[int, str] = {}
 pending_admin_deposit: dict[int, int] = {}  # admin_user_id -> target_customer_id
+pending_coupon_input: dict[int, bool] = {}  # user_id -> awaiting coupon code
+pending_warranty_reason: dict[int, dict] = {}  # user_id -> {order_code, account_text}
+pending_admin_search: set[int] = set()  # admin_user_id waiting for search keyword
+pending_admin_coupon: dict[int, dict] = {}  # admin_id -> coupon creation step data
 
 
 def make_order_code() -> int:
@@ -424,15 +433,9 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         if not is_admin(callback.from_user.id, settings):
             await callback.answer("Bạn không có quyền.", show_alert=True)
             return
-        stats = await db.get_order_stats()
         await callback.message.answer(
-            "📊 <b>Thống kê shop</b>\n\n"
-            f"Đơn hàng: <b>{stats['total_orders']}</b>\n"
-            f"Đang chờ thanh toán: <b>{stats['pending_orders']}</b>\n"
-            f"Đã thanh toán: <b>{stats['paid_orders']}</b>\n"
-            f"Doanh thu đã thanh toán: <b>{money_vnd(stats['revenue'])}</b>\n"
-            f"Sản phẩm đang bán: <b>{stats['products']}</b>",
-            reply_markup=admin_keyboard(),
+            "📊 <b>Thống kê nâng cao</b>\n\nChọn khoảng thời gian:",
+            reply_markup=admin_stats_keyboard(),
         )
         await callback.answer()
 
@@ -1147,6 +1150,11 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         product = pending["product"]
         qty = int(pending["qty"])
         total = int(product["price"]) * qty
+        # Apply coupon discount if present
+        coupon = pending.get("coupon")
+        discount = pending.get("discount", 0)
+        if discount > 0:
+            total = max(total - discount, 0)
         
         balance = await db.get_wallet_balance(callback.from_user.id)
         if balance < total:
@@ -1186,6 +1194,12 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             items=[item],
             total=total,
         )
+        # Record coupon usage
+        if coupon:
+            try:
+                await db.apply_coupon(coupon["id"], callback.from_user.id, order_code)
+            except Exception:
+                pass
         
         # Auto-mark as paid since wallet was debited
         reference = f"wallet-{callback.from_user.id}-{order_code}"
@@ -1255,6 +1269,11 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             return
 
         total = int(latest_product["price"]) * qty
+        # Apply coupon discount if present
+        coupon = pending.get("coupon")
+        discount = pending.get("discount", 0)
+        if discount > 0:
+            total = max(total - discount, 0)
         order_code = make_order_code()
         item = {
             "id": latest_product["id"],
@@ -1271,6 +1290,12 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             total=total,
             expires_in_minutes=settings.order_expire_minutes,
         )
+        # Record coupon usage
+        if coupon:
+            try:
+                await db.apply_coupon(coupon["id"], callback.from_user.id, order_code)
+            except Exception:
+                pass
 
         try:
             payment_info = sepay.build_payment_info(order_code=order_code, amount=total)
@@ -1299,20 +1324,25 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             f"👤 Chủ tài khoản: <b>{html_escape(settings.sepay_account_name) or 'Chưa cấu hình'}</b>\n\n"
             "✅ Sau khi chuyển thành công, bot sẽ tự động xác nhận và gửi tài khoản."
         )
-        await callback.message.answer_photo(
+        qr_msg = await callback.message.answer_photo(
             photo=payment_info.qr_url,
             caption=caption,
             reply_markup=payment_keyboard(order_code),
         )
-        await callback.message.answer("🕘 Sau khi chuyển khoản thành công, bot sẽ tự động xác nhận và gửi tài khoản.")
+        wait_msg = await callback.message.answer("🕘 Sau khi chuyển khoản thành công, bot sẽ tự động xác nhận và gửi tài khoản.")
+        # Track QR + wait message IDs for cleanup after payment
+        try:
+            await db.save_qr_message_ids(order_code, qr_msg.message_id, wait_msg.message_id)
+        except Exception:
+            pass
         await callback.answer("Đã tạo QR thanh toán.")
 
     @router.callback_query(F.data.in_({"language"}))
-    async def menu_placeholder(callback: CallbackQuery):
+    async def language_menu(callback: CallbackQuery):
+        lang = await db.get_language(callback.from_user.id)
         await callback.message.answer(
-            "🌐 <b>Ngôn ngữ</b>\n\n"
-            "Hiện bot đang hỗ trợ <b>Tiếng Việt</b>.\n"
-            "Các ngôn ngữ khác sẽ được cập nhật sau."
+            "🌐 <b>Chọn ngôn ngữ / Select Language</b>",
+            reply_markup=language_keyboard(lang),
         )
         await callback.answer()
 
@@ -1430,7 +1460,7 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             return
         await callback.message.answer(
             render_order_detail(order),
-            reply_markup=order_detail_keyboard(order_code),
+            reply_markup=order_detail_keyboard(order_code, status=order.get("status", "")),
         )
         await callback.answer()
 
@@ -1443,7 +1473,7 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             return
         await callback.message.answer(
             render_order_detail(order),
-            reply_markup=order_detail_keyboard(order_code),
+            reply_markup=order_detail_keyboard(order_code, status=order.get("status", "")),
         )
         await callback.answer()
 
@@ -1486,5 +1516,526 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
                 f"{money_vnd(int(order['total']))} | <b>{order['status']}</b>"
             )
         await message.answer("\n".join(lines))
+
+    # ── Stats sub-callbacks ──────────────────────────────────
+
+    @router.callback_query(F.data.startswith("stats:"))
+    async def stats_sub(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        action = callback.data.split(":", 1)[1]
+
+        if action in ("today", "week", "month"):
+            stats = await db.get_revenue_stats(action)
+            period_labels = {"today": "Hôm nay", "week": "Tuần này", "month": "Tháng này"}
+            await callback.message.answer(
+                f"📊 <b>Thống kê {period_labels[action]}</b>\n\n"
+                f"💰 Doanh thu: <b>{money_vnd(stats['revenue'])}</b>\n"
+                f"📦 Đơn đã thanh toán: <b>{stats['paid_orders']}</b>\n"
+                f"⏳ Đơn pending: <b>{stats['pending_orders']}</b>\n"
+                f"👥 Khách hàng: <b>{stats['unique_customers']}</b>",
+                reply_markup=admin_stats_keyboard(),
+            )
+        elif action == "top_products":
+            products = await db.get_top_products(5)
+            if not products:
+                await callback.message.answer("Chưa có dữ liệu bán hàng.", reply_markup=admin_stats_keyboard())
+            else:
+                lines = ["🏆 <b>Top sản phẩm bán chạy</b>\n"]
+                for i, p in enumerate(products, 1):
+                    lines.append(
+                        f"{i}. <b>{html_escape(p['product_name'])}</b>\n"
+                        f"   📦 {p['total_qty']} đơn — 💰 {money_vnd(int(p['total_revenue']))}"
+                    )
+                await callback.message.answer("\n".join(lines), reply_markup=admin_stats_keyboard())
+        elif action == "top_customers":
+            customers = await db.get_top_customers(5)
+            if not customers:
+                await callback.message.answer("Chưa có dữ liệu khách hàng.", reply_markup=admin_stats_keyboard())
+            else:
+                lines = ["👑 <b>Top khách hàng</b>\n"]
+                for i, c in enumerate(customers, 1):
+                    uname = f"@{c['username']}" if c.get('username') else str(c['user_id'])
+                    lines.append(
+                        f"{i}. <b>{html_escape(uname)}</b>\n"
+                        f"   📦 {c['order_count']} đơn — 💰 {money_vnd(int(c['total_spent']))}"
+                    )
+                await callback.message.answer("\n".join(lines), reply_markup=admin_stats_keyboard())
+        await callback.answer()
+
+    # ── Admin Search ─────────────────────────────────────────
+
+    @router.callback_query(F.data == "admin:search")
+    async def admin_search_prompt(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        pending_admin_search.add(callback.from_user.id)
+        await callback.message.answer(
+            "🔍 <b>Tìm đơn hàng</b>\n\n"
+            "Nhập mã đơn hàng, username hoặc user ID để tìm:"
+        )
+        await callback.answer()
+
+    # ── Admin Coupons ────────────────────────────────────────
+
+    @router.callback_query(F.data == "admin:coupons")
+    async def admin_coupons_list(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        coupons = await db.list_coupons(active_only=True)
+        await callback.message.answer(
+            "🎫 <b>Quản lý mã giảm giá</b>\n\n"
+            f"Hiện có <b>{len(coupons)}</b> coupon đang hoạt động.",
+            reply_markup=admin_coupon_keyboard(coupons),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data == "admin:coupon_create")
+    async def admin_coupon_create(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        pending_admin_coupon[callback.from_user.id] = {"step": "code"}
+        await callback.message.answer(
+            "🎫 <b>Tạo coupon mới</b>\n\n"
+            "Nhập theo format:\n"
+            "<code>MÃ LOẠI GIÁ_TRỊ SỐ_LƯỢT</code>\n\n"
+            "Ví dụ:\n"
+            "• <code>SALE50 percent 50 100</code> → giảm 50%, 100 lượt\n"
+            "• <code>GIAM20K fixed 20000 50</code> → giảm 20k, 50 lượt\n"
+            "• <code>VIP percent 30</code> → giảm 30%, không giới hạn\n\n"
+            "Gõ <code>hủy</code> để hủy."
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:coupon_view:"))
+    async def admin_coupon_view(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        coupon_id = int(callback.data.rsplit(":", 1)[1])
+        coupons = await db.list_coupons(active_only=False)
+        coupon = next((c for c in coupons if c["id"] == coupon_id), None)
+        if not coupon:
+            await callback.answer("Coupon không tồn tại.", show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🗑 Xóa coupon", callback_data=f"admin:coupon_delete:{coupon_id}")
+        kb.button(text="⬅️ Về danh sách", callback_data="admin:coupons")
+        kb.adjust(1)
+        dt = coupon['discount_type']
+        dv = coupon['discount_value']
+        discount_text = f"{dv}%" if dt == 'percent' else money_vnd(dv)
+        uses = f"{coupon['used_count']}/{coupon['max_uses']}" if coupon.get('max_uses') else f"{coupon['used_count']}/∞"
+        await callback.message.answer(
+            f"🎫 <b>Coupon: {html_escape(coupon['code'])}</b>\n\n"
+            f"💰 Giảm: <b>{discount_text}</b> ({dt})\n"
+            f"📊 Đã dùng: <b>{uses}</b>\n"
+            f"📅 Tạo: <code>{coupon['created_at'][:19]}</code>\n"
+            f"⏰ Hết hạn: <b>{coupon.get('expires_at') or 'Không'}</b>\n"
+            f"🟢 Active: <b>{'Có' if coupon['is_active'] else 'Không'}</b>",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:coupon_delete:"))
+    async def admin_coupon_delete(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        coupon_id = int(callback.data.rsplit(":", 1)[1])
+        deleted = await db.delete_coupon(coupon_id)
+        if deleted:
+            await callback.answer("✅ Đã xóa coupon.", show_alert=True)
+        else:
+            await callback.answer("❌ Không thể xóa.", show_alert=True)
+        coupons = await db.list_coupons(active_only=True)
+        await callback.message.answer(
+            f"🎫 <b>Quản lý mã giảm giá</b>\nHiện có <b>{len(coupons)}</b> coupon.",
+            reply_markup=admin_coupon_keyboard(coupons),
+        )
+
+    # ── Customer Coupon Flow ─────────────────────────────────
+
+    @router.callback_query(F.data == "coupon:enter")
+    async def coupon_enter(callback: CallbackQuery):
+        pending_coupon_input[callback.from_user.id] = True
+        await callback.message.answer(
+            "🎫 <b>Nhập mã giảm giá</b>\n\n"
+            "Gõ mã coupon của bạn (VD: <code>SALE50</code>)\n"
+            "Gõ <code>bỏ qua</code> để tiếp tục không dùng mã."
+        )
+        await callback.answer()
+
+    # ── Admin Warranties ─────────────────────────────────────
+
+    @router.callback_query(F.data == "admin:warranties")
+    async def admin_warranties_list(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        warranties = await db.list_warranties(status="pending")
+        if not warranties:
+            await callback.message.answer(
+                "🔄 <b>Bảo hành</b>\n\nKhông có yêu cầu bảo hành nào đang chờ.",
+                reply_markup=admin_keyboard(),
+            )
+        else:
+            await callback.message.answer(
+                f"🔄 <b>Yêu cầu bảo hành</b>\n\nCó <b>{len(warranties)}</b> yêu cầu đang chờ duyệt.",
+                reply_markup=admin_warranty_keyboard(warranties),
+            )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("admin:warranty_view:"))
+    async def admin_warranty_view(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        wid = int(callback.data.rsplit(":", 1)[1])
+        w = await db.get_warranty(wid)
+        if not w:
+            await callback.answer("Không tìm thấy.", show_alert=True)
+            return
+        kb = InlineKeyboardBuilder()
+        if w["status"] == "pending":
+            kb.button(text="✅ Duyệt (cấp TK mới)", callback_data=f"warranty_approve:{wid}")
+            kb.button(text="❌ Từ chối", callback_data=f"warranty_reject:{wid}")
+        kb.button(text="⬅️ Về danh sách", callback_data="admin:warranties")
+        kb.adjust(2, 1)
+        status_emoji = {"pending": "⏳", "approved": "✅", "rejected": "❌"}.get(w['status'], '❓')
+        await callback.message.answer(
+            f"🔄 <b>Yêu cầu bảo hành #{w['id']}</b>\n\n"
+            f"📦 Đơn: <code>#{w['order_code']}</code>\n"
+            f"👤 Khách: @{html_escape(str(w.get('username') or w['user_id']))}\n"
+            f"📝 TK bị lỗi: <code>{html_escape(w['account_text'])}</code>\n"
+            f"💬 Lý do: {html_escape(w['reason'])}\n"
+            f"📅 Ngày gửi: <code>{w['created_at'][:19]}</code>\n"
+            f"🔹 Trạng thái: {status_emoji} {w['status']}",
+            reply_markup=kb.as_markup(),
+        )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("warranty_approve:"))
+    async def warranty_approve_cb(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        wid = int(callback.data.split(":", 1)[1])
+        w = await db.get_warranty(wid)
+        if not w or w["status"] != "pending":
+            await callback.answer("Yêu cầu đã được xử lý.", show_alert=True)
+            return
+        # Try to get a new account from product stock
+        order = await db.get_order_by_code(w["order_code"])
+        if not order:
+            await callback.answer("Không tìm thấy đơn gốc.", show_alert=True)
+            return
+        import json as _json
+        items = _json.loads(order["items_json"]) if isinstance(order["items_json"], str) else order["items_json"]
+        product_id = items[0]["id"] if items else None
+        new_account = None
+        if product_id:
+            accs = await db.get_available_accounts(product_id, 1)
+            if accs:
+                new_account = accs[0]["account_text"]
+                await db.mark_account_sold(accs[0]["id"], w["order_code"])
+        if not new_account:
+            await callback.answer("❌ Hết tài khoản thay thế trong kho!", show_alert=True)
+            return
+        ok = await db.approve_warranty(wid, new_account, f"Admin duyệt")
+        if ok:
+            # Notify customer
+            try:
+                from aiogram import Bot
+                bot = Bot.get_current()
+                await bot.send_message(
+                    chat_id=w["user_id"],
+                    text=(
+                        "✅ <b>Bảo hành được duyệt!</b>\n\n"
+                        f"Đơn hàng: <code>#{w['order_code']}</code>\n"
+                        f"TK cũ (lỗi): <code>{html_escape(w['account_text'])}</code>\n"
+                        f"🆕 TK mới: <code>{html_escape(new_account)}</code>\n\n"
+                        "Cảm ơn bạn đã phản hồi! 🙏"
+                    ),
+                )
+            except Exception:
+                pass
+            await callback.answer("✅ Đã duyệt + gửi TK mới cho khách.", show_alert=True)
+        else:
+            await callback.answer("❌ Lỗi duyệt.", show_alert=True)
+        warranties = await db.list_warranties(status="pending")
+        await callback.message.answer(
+            f"🔄 <b>Bảo hành</b> — Còn <b>{len(warranties)}</b> yêu cầu pending.",
+            reply_markup=admin_warranty_keyboard(warranties),
+        )
+
+    @router.callback_query(F.data.startswith("warranty_reject:"))
+    async def warranty_reject_cb(callback: CallbackQuery):
+        if not is_admin(callback.from_user.id, settings):
+            await callback.answer("Bạn không có quyền.", show_alert=True)
+            return
+        wid = int(callback.data.split(":", 1)[1])
+        ok = await db.reject_warranty(wid, "Admin từ chối")
+        if ok:
+            w = await db.get_warranty(wid)
+            if w:
+                try:
+                    from aiogram import Bot
+                    bot = Bot.get_current()
+                    await bot.send_message(
+                        chat_id=w["user_id"],
+                        text=(
+                            "❌ <b>Yêu cầu bảo hành bị từ chối</b>\n\n"
+                            f"Đơn hàng: <code>#{w['order_code']}</code>\n"
+                            "Liên hệ admin nếu cần hỗ trợ thêm."
+                        ),
+                    )
+                except Exception:
+                    pass
+            await callback.answer("❌ Đã từ chối.", show_alert=True)
+        else:
+            await callback.answer("Lỗi.", show_alert=True)
+        warranties = await db.list_warranties(status="pending")
+        await callback.message.answer(
+            f"🔄 <b>Bảo hành</b> — Còn <b>{len(warranties)}</b> yêu cầu pending.",
+            reply_markup=admin_warranty_keyboard(warranties),
+        )
+
+    # ── Customer Warranty Request ─────────────────────────────
+
+    @router.callback_query(F.data.startswith("warranty:request:"))
+    async def warranty_request_start(callback: CallbackQuery):
+        order_code = int(callback.data.rsplit(":", 1)[1])
+        order = await db.get_user_order_detail(order_code, callback.from_user.id)
+        if not order or order.get("status") != "paid":
+            await callback.answer("Chỉ đơn đã thanh toán mới được bảo hành.", show_alert=True)
+            return
+        # Get accounts assigned to this order
+        accounts = await db.get_order_accounts(order_code)
+        if not accounts:
+            await callback.answer("Đơn này chưa có tài khoản nào được giao.", show_alert=True)
+            return
+        # If only 1 account, go straight to reason
+        if len(accounts) == 1:
+            pending_warranty_reason[callback.from_user.id] = {
+                "order_code": order_code,
+                "account_text": accounts[0]["account_text"],
+            }
+            await callback.message.answer(
+                "🔄 <b>Yêu cầu bảo hành</b>\n\n"
+                f"Đơn: <code>#{order_code}</code>\n"
+                f"TK: <code>{html_escape(accounts[0]['account_text'])}</code>\n\n"
+                "Vui lòng nhập lý do bảo hành:\n"
+                "(VD: <i>tài khoản bị khóa, sai mật khẩu...</i>)"
+            )
+        else:
+            # Multiple accounts - let user pick
+            kb = InlineKeyboardBuilder()
+            for acc in accounts:
+                short = acc['account_text'][:40]
+                kb.button(text=f"📋 {short}...", callback_data=f"warranty_pick:{order_code}:{acc['id']}")
+            kb.button(text="❌ Hủy", callback_data=f"orderdetail:{order_code}")
+            kb.adjust(1)
+            await callback.message.answer(
+                "🔄 <b>Chọn tài khoản cần bảo hành:</b>",
+                reply_markup=kb.as_markup(),
+            )
+        await callback.answer()
+
+    @router.callback_query(F.data.startswith("warranty_pick:"))
+    async def warranty_pick_account(callback: CallbackQuery):
+        parts = callback.data.split(":")
+        order_code = int(parts[1])
+        acc_id = int(parts[2])
+        accounts = await db.get_order_accounts(order_code)
+        acc = next((a for a in accounts if a["id"] == acc_id), None)
+        if not acc:
+            await callback.answer("Không tìm thấy tài khoản.", show_alert=True)
+            return
+        pending_warranty_reason[callback.from_user.id] = {
+            "order_code": order_code,
+            "account_text": acc["account_text"],
+        }
+        await callback.message.answer(
+            "🔄 <b>Yêu cầu bảo hành</b>\n\n"
+            f"TK: <code>{html_escape(acc['account_text'])}</code>\n\n"
+            "Vui lòng nhập lý do bảo hành:"
+        )
+        await callback.answer()
+
+    # ── Language Toggle ──────────────────────────────────────
+
+    @router.callback_query(F.data.startswith("lang:"))
+    async def language_toggle(callback: CallbackQuery):
+        lang = callback.data.split(":", 1)[1]
+        if lang not in ("vi", "en"):
+            await callback.answer("Ngôn ngữ không hợp lệ.", show_alert=True)
+            return
+        await db.get_or_create_profile(
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+        )
+        await db.set_language(callback.from_user.id, lang)
+        label = "Tiếng Việt 🇻🇳" if lang == "vi" else "English 🇬🇧"
+        await callback.message.answer(
+            f"✅ Đã chuyển ngôn ngữ sang <b>{label}</b>",
+            reply_markup=language_keyboard(lang),
+        )
+        await callback.answer()
+
+    # ── Text message handler for pending inputs ──────────────
+
+    @router.message(F.text)
+    async def handle_text_inputs(message: Message):
+        uid = message.from_user.id
+        text = message.text.strip()
+
+        # Admin search
+        if uid in pending_admin_search:
+            pending_admin_search.discard(uid)
+            results = await db.search_orders(text, limit=10)
+            if not results:
+                await message.answer(
+                    f"🔍 Không tìm thấy đơn hàng nào cho: <code>{html_escape(text)}</code>",
+                    reply_markup=admin_keyboard(),
+                )
+                return
+            lines = [f"🔍 <b>Kết quả tìm kiếm: {html_escape(text)}</b>\n"]
+            for o in results:
+                uname = f"@{o['username']}" if o.get('username') else str(o['user_id'])
+                status_icon = "✅" if o['status'] == 'paid' else "⏳" if o['status'] == 'pending' else "❌"
+                lines.append(
+                    f"{status_icon} <code>#{o['order_code']}</code> | {html_escape(uname)} | "
+                    f"{money_vnd(int(o['total']))} | {o['status']}"
+                )
+            await message.answer("\n".join(lines), reply_markup=admin_keyboard())
+            return
+
+        # Admin coupon creation
+        if uid in pending_admin_coupon:
+            if text.lower() in ("hủy", "huy", "cancel"):
+                pending_admin_coupon.pop(uid, None)
+                await message.answer("❌ Đã hủy tạo coupon.", reply_markup=admin_keyboard())
+                return
+            parts = text.split()
+            if len(parts) < 3:
+                await message.answer(
+                    "❌ Sai format. Nhập: <code>MÃ LOẠI GIÁ_TRỊ [SỐ_LƯỢT]</code>\n"
+                    "VD: <code>SALE50 percent 50 100</code>"
+                )
+                return
+            code = parts[0].upper()
+            dtype = parts[1].lower()
+            if dtype not in ("percent", "fixed"):
+                await message.answer("❌ Loại phải là <code>percent</code> hoặc <code>fixed</code>.")
+                return
+            try:
+                dvalue = int(parts[2])
+            except ValueError:
+                await message.answer("❌ Giá trị giảm phải là số.")
+                return
+            max_uses = None
+            if len(parts) >= 4:
+                try:
+                    max_uses = int(parts[3])
+                except ValueError:
+                    pass
+            try:
+                coupon = await db.create_coupon(
+                    code=code, discount_type=dtype, discount_value=dvalue, max_uses=max_uses
+                )
+                pending_admin_coupon.pop(uid, None)
+                discount_text = f"{dvalue}%" if dtype == 'percent' else money_vnd(dvalue)
+                uses_text = str(max_uses) if max_uses else "∞"
+                await message.answer(
+                    f"✅ <b>Đã tạo coupon!</b>\n\n"
+                    f"🎫 Mã: <code>{html_escape(code)}</code>\n"
+                    f"💰 Giảm: <b>{discount_text}</b>\n"
+                    f"📊 Giới hạn: <b>{uses_text}</b> lượt",
+                    reply_markup=admin_keyboard(),
+                )
+            except Exception as e:
+                await message.answer(f"❌ Lỗi: <code>{html_escape(str(e))}</code>")
+            return
+
+        # Customer coupon input
+        if uid in pending_coupon_input:
+            pending_coupon_input.pop(uid, None)
+            if text.lower() in ("bỏ qua", "bo qua", "skip"):
+                pending = pending_orders.get(uid)
+                if pending:
+                    await message.answer(
+                        "👌 Tiếp tục thanh toán không dùng mã giảm giá.",
+                        reply_markup=confirm_order_keyboard(has_coupon=False),
+                    )
+                return
+            pending = pending_orders.get(uid)
+            if not pending:
+                await message.answer("Không tìm thấy đơn hàng đang chờ.")
+                return
+            total = int(pending["product"]["price"]) * int(pending["qty"])
+            valid, msg, coupon = await db.validate_coupon(text, uid, total)
+            if not valid:
+                await message.answer(f"❌ {msg}\n\nBạn có thể thử mã khác hoặc gõ <code>bỏ qua</code>.")
+                pending_coupon_input[uid] = True  # Keep waiting
+                return
+            # Calculate discounted price
+            if coupon["discount_type"] == "percent":
+                discount = total * coupon["discount_value"] // 100
+            else:
+                discount = coupon["discount_value"]
+            discount = min(discount, total)
+            new_total = total - discount
+            pending["coupon"] = coupon
+            pending["discount"] = discount
+            await message.answer(
+                f"✅ <b>Áp dụng mã {html_escape(coupon['code'])} thành công!</b>\n\n"
+                f"💰 Giá gốc: {money_vnd(total)}\n"
+                f"🎫 Giảm: -{money_vnd(discount)}\n"
+                f"💵 Thanh toán: <b>{money_vnd(new_total)}</b>",
+                reply_markup=confirm_order_keyboard(has_coupon=True),
+            )
+            return
+
+        # Warranty reason input
+        if uid in pending_warranty_reason:
+            data = pending_warranty_reason.pop(uid)
+            w = await db.create_warranty(
+                order_code=data["order_code"],
+                user_id=uid,
+                username=message.from_user.username,
+                account_text=data["account_text"],
+                reason=text,
+            )
+            await message.answer(
+                "✅ <b>Đã gửi yêu cầu bảo hành!</b>\n\n"
+                f"Mã: <code>#{w['id']}</code>\n"
+                f"Đơn: <code>#{data['order_code']}</code>\n"
+                f"TK: <code>{html_escape(data['account_text'])}</code>\n\n"
+                "Admin sẽ xem xét và phản hồi sớm. 🙏",
+                reply_markup=main_menu_keyboard(),
+            )
+            # Notify admins
+            for admin_id in settings.admin_ids:
+                try:
+                    from aiogram import Bot
+                    bot = Bot.get_current()
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "🔄 <b>Yêu cầu bảo hành mới!</b>\n\n"
+                            f"👤 @{message.from_user.username or uid}\n"
+                            f"📦 Đơn: <code>#{data['order_code']}</code>\n"
+                            f"📝 TK: <code>{html_escape(data['account_text'])}</code>\n"
+                            f"💬 Lý do: {html_escape(text)}"
+                        ),
+                    )
+                except Exception:
+                    pass
+            return
 
     dp.include_router(router)
