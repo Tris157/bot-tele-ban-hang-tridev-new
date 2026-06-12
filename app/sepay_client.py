@@ -83,7 +83,7 @@ class SePayClient:
         )
 
     async def verify_webhook_request(self, request: Request) -> tuple[bool, str]:
-        """Verify request đến từ SePay.
+        """Verify request đến từ SePay with detailed logging on failure.
 
         SePay có nhiều kiểu cấu hình webhook. Project này hỗ trợ:
         - SEPAY_AUTH_MODE=api_key: header Authorization: Apikey <key>
@@ -96,18 +96,29 @@ class SePayClient:
 
         if mode == "api_key":
             if not self.webhook_api_key:
+                print(f"  [AUTH ERROR] Missing SEPAY_WEBHOOK_API_KEY in configuration")
                 return False, "Server thiếu SEPAY_WEBHOOK_API_KEY"
             auth = request.headers.get("authorization", "").strip()
             expected = f"Apikey {self.webhook_api_key}"
             if auth != expected:
+                # Enhanced logging - sanitize by showing only format
+                auth_format = auth.split()[0] if auth else "(empty)"
+                print(f"  [AUTH ERROR] Authorization header mismatch")
+                print(f"    Received format: {auth_format}")
+                print(f"    Expected format: Apikey <key>")
+                print(f"    Auth mode: {mode}")
                 return False, "Sai Authorization header"
             return True, "OK"
 
         if mode == "secret_key":
             if not self.webhook_secret_key:
+                print(f"  [AUTH ERROR] Missing SEPAY_WEBHOOK_SECRET_KEY in configuration")
                 return False, "Server thiếu SEPAY_WEBHOOK_SECRET_KEY"
             secret = request.headers.get("x-secret-key", "").strip()
             if secret != self.webhook_secret_key:
+                print(f"  [AUTH ERROR] X-Secret-Key mismatch")
+                print(f"    Received: {'(present)' if secret else '(missing)'}")
+                print(f"    Auth mode: {mode}")
                 return False, "Sai X-Secret-Key header"
             return True, "OK"
 
@@ -199,14 +210,50 @@ class SePayClient:
 
     @staticmethod
     def extract_payment_code(tx: SePayTransaction) -> str | None:
-        # FIX: SePay field `code` thường bị cắt ngắn (vd: DH1779982853 thay vì DH1779982853451).
-        # Luôn ưu tiên tìm mã DH dài nhất từ `content` (nội dung chuyển khoản) vì nó chứa đầy đủ.
-        # Chỉ fallback sang `payment_code` (field code) nếu content không có.
-        content_upper = tx.content.upper()
-        matches = re.findall(r"DH\d+", content_upper)
-        if matches:
-            # Lấy mã dài nhất (đầy đủ nhất)
-            return max(matches, key=len)
+        """Extract payment code (single best match). Deprecated: prefer extract_payment_code_candidates."""
+        candidates = SePayClient.extract_payment_code_candidates(tx)
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def extract_payment_code_candidates(tx: SePayTransaction) -> list[str]:
+        """Extract ALL candidate payment codes, ordered from most likely to least likely.
+
+        Banks often append extra digits to the transfer content. For example,
+        the customer sends content "DH1781101387" but the bank records it as
+        "DH1781101387004". The old logic picked the longest DH\\d+ match from
+        content, which grabbed the extra digits and failed DB lookup.
+
+        Strategy:
+        1. Collect the `code`/`payment_code` field from payload (often correct).
+        2. Collect all DH\\d+ matches from content.
+        3. Deduplicate and sort: exact code-field match first, then shorter
+           codes before longer ones (shorter = less likely to have bank junk).
+        """
+        seen: set[str] = set()
+        candidates: list[str] = []
+
+        def _add(code: str) -> None:
+            upper = code.upper().strip()
+            if upper and upper not in seen:
+                seen.add(upper)
+                candidates.append(upper)
+
+        # Priority 1: payment_code / code field (SePay usually sends the real code here)
         if tx.payment_code:
-            return tx.payment_code.upper()
-        return None
+            code_upper = tx.payment_code.upper().strip()
+            if re.fullmatch(r"DH\d+", code_upper):
+                _add(code_upper)
+
+        # Priority 2: All DH codes found in content, shortest first
+        content_upper = tx.content.upper()
+        content_matches = re.findall(r"DH\d+", content_upper)
+        # Sort shortest first – shorter codes are less likely to have bank-appended junk
+        for m in sorted(set(content_matches), key=len):
+            _add(m)
+
+        if candidates:
+            print(f"  [PAYMENT CODE CANDIDATES] {candidates}")
+        else:
+            print(f"  [PAYMENT CODE] Not found in content or payment_code field")
+
+        return candidates

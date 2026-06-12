@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -67,12 +67,22 @@ class Database:
                     qr_message_id INTEGER,
                     payment_reference TEXT,
                     created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    expired_notified_at TEXT,
                     paid_at TEXT
                 )
                 """
             )
             try:
                 await db.execute("ALTER TABLE orders ADD COLUMN qr_message_id INTEGER")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN expires_at TEXT")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN expired_notified_at TEXT")
             except Exception:
                 pass
 
@@ -138,6 +148,7 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_expires_at ON orders(expires_at)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_orders_payment_link_id ON orders(payment_link_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_code ON order_items(order_code)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_product_accounts_product_status ON product_accounts(product_id, status)")
@@ -174,6 +185,20 @@ class Database:
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_key ON api_keys(api_key)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS product_waitlist (
+                    product_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (product_id, user_id),
+                    FOREIGN KEY (product_id) REFERENCES products(id)
+                )
+                """
+            )
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_product_waitlist_product ON product_waitlist(product_id)")
 
             await self._backfill_order_items(db)
 
@@ -321,6 +346,7 @@ class Database:
         username: str | None,
         items: list[dict[str, Any]],
         total: int,
+        expires_in_minutes: int | None = None,
     ) -> int:
         compact_items = [
             {
@@ -332,12 +358,17 @@ class Database:
             }
             for item in items
         ]
+        created_at = datetime.now().isoformat(timespec="seconds")
+        expires_at = None
+        if expires_in_minutes and expires_in_minutes > 0:
+            expires_at = (datetime.now() + timedelta(minutes=expires_in_minutes)).isoformat(timespec="seconds")
+
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute(
                 """
                 INSERT INTO orders
-                (order_code, user_id, username, items_json, total, status, created_at)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                (order_code, user_id, username, items_json, total, status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     order_code,
@@ -345,10 +376,10 @@ class Database:
                     username,
                     json.dumps(compact_items, ensure_ascii=False),
                     total,
-                    datetime.now().isoformat(timespec="seconds"),
+                    created_at,
+                    expires_at,
                 ),
             )
-            created_at = datetime.now().isoformat(timespec="seconds")
             for item in compact_items:
                 await db.execute(
                     """
@@ -428,6 +459,44 @@ class Database:
             order["accounts"] = await self._list_order_accounts(db, int(order["order_code"]))
             return order
 
+    async def get_order_by_payment_code_prefix(self, payment_code_prefix: str) -> dict[str, Any] | None:
+        """Fuzzy lookup: find order whose payment_link_id is a prefix of the given code.
+
+        Use case: bank appends extra digits to the transfer content, e.g.
+        payment_link_id="DH1781101387" but webhook content has "DH1781101387004".
+        This finds orders where payment_link_id matches the start of the given code.
+        """
+        if len(payment_code_prefix) < 5:
+            # Too short to safely prefix-match
+            return None
+
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            # Find orders where the given code STARTS WITH the stored payment_link_id
+            # i.e. stored "DH1781101387" is a prefix of input "DH1781101387004"
+            rows = await db.execute_fetchall(
+                """
+                SELECT * FROM orders
+                WHERE ? LIKE payment_link_id || '%'
+                  AND payment_link_id IS NOT NULL
+                  AND LENGTH(payment_link_id) >= 5
+                ORDER BY
+                    CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+                    LENGTH(payment_link_id) DESC,
+                    id DESC
+                LIMIT 1
+                """,
+                (payment_code_prefix,),
+            )
+            if not rows:
+                return None
+            order = dict(rows[0])
+            order["items"] = await self._list_order_items(db, int(order["order_code"]))
+            if not order["items"]:
+                order["items"] = json.loads(order["items_json"])
+            order["accounts"] = await self._list_order_accounts(db, int(order["order_code"]))
+            return order
+
     async def _list_order_items(self, db: aiosqlite.Connection, order_code: int) -> list[dict[str, Any]]:
         rows = await db.execute_fetchall(
             """
@@ -475,6 +544,7 @@ class Database:
             )
             if existing:
                 await db.commit()
+                print(f"  [DUPLICATE] Transaction {reference} already processed")
                 return False, "Giao dịch đã xử lý trước đó.", None
 
             rows = await db.execute_fetchall(
@@ -501,12 +571,26 @@ class Database:
                 await db.rollback()
                 return False, f"Đơn không ở trạng thái pending: {order['status']}", None
 
+            expires_at = order.get("expires_at")
+            if expires_at and datetime.fromisoformat(str(expires_at)) <= datetime.now():
+                await db.execute(
+                    """
+                    UPDATE orders
+                    SET status = 'expired', expired_notified_at = COALESCE(expired_notified_at, ?)
+                    WHERE order_code = ? AND status = 'pending'
+                    """,
+                    (datetime.now().isoformat(timespec="seconds"), order_code),
+                )
+                await db.commit()
+                return False, "Don da het han thanh toan. Vui long tao don moi.", None
+
             order_total = int(order["total"])
             paid_amount = int(amount)
             # Cho phép chênh lệch nhỏ do phí ngân hàng (tối đa 1% hoặc 1000đ, lấy giá trị lớn hơn)
             tolerance = max(int(order_total * 0.01), 1000)
             if abs(order_total - paid_amount) > tolerance:
                 await db.rollback()
+                print(f"  [AMOUNT MISMATCH] Order: {order_total}, Paid: {paid_amount}, Tolerance: {tolerance}, Diff: {abs(order_total - paid_amount)}")
                 return False, f"Số tiền không khớp: đơn={order_total}, nhận={paid_amount}.", None
 
             items = json.loads(order["items_json"])
@@ -546,6 +630,78 @@ class Database:
             order["status"] = "paid"
             order["payment_reference"] = reference
             return True, "Đã xác nhận thanh toán.", order
+
+    async def expire_due_orders(self) -> list[dict[str, Any]]:
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT *
+                FROM orders
+                WHERE status = 'pending'
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= ?
+                  AND expired_notified_at IS NULL
+                ORDER BY id ASC
+                """,
+                (now,),
+            )
+            orders = [dict(row) for row in rows]
+            if not orders:
+                return []
+
+            order_codes = [int(order["order_code"]) for order in orders]
+            placeholders = ",".join("?" for _ in order_codes)
+            await db.execute(
+                f"""
+                UPDATE orders
+                SET status = 'expired', expired_notified_at = ?
+                WHERE order_code IN ({placeholders})
+                  AND status = 'pending'
+                  AND expired_notified_at IS NULL
+                """,
+                (now, *order_codes),
+            )
+            await db.commit()
+            return orders
+
+    async def add_stock_waiter(
+        self,
+        *,
+        product_id: str,
+        user_id: int,
+        username: str | None,
+    ) -> tuple[bool, str]:
+        product = await self.get_product(product_id)
+        if not product:
+            return False, "San pham khong ton tai hoac da bi an."
+        if int(product.get("stock", 0)) > 0:
+            return False, "San pham dang co hang, ban co the mua ngay."
+
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO product_waitlist(product_id, user_id, username, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (product_id, user_id, username, datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+        return True, "Da luu yeu cau. Bot se bao khi san pham co hang lai."
+
+    async def pop_stock_waiters(self, product_id: str) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                "SELECT * FROM product_waitlist WHERE product_id = ? ORDER BY created_at ASC",
+                (product_id,),
+            )
+            waiters = [dict(row) for row in rows]
+            if waiters:
+                await db.execute("DELETE FROM product_waitlist WHERE product_id = ?", (product_id,))
+                await db.commit()
+            return waiters
 
     async def list_user_orders(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:

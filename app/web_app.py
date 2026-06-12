@@ -147,18 +147,36 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
             print(f"  [SKIP] Ignored non-credit transaction: transfer_type={tx.transfer_type!r}")
             return {"success": True, "message": "Ignored non-credit transaction"}
 
-        payment_code = sepay.extract_payment_code(tx)
-        if not payment_code:
-            print(f"  [SKIP] No payment code found, content={tx.content!r}")
+        payment_codes = sepay.extract_payment_code_candidates(tx)
+        if not payment_codes:
+            print(f"  [SKIP] No payment code found")
+            print(f"    Content: {tx.content!r}")
+            print(f"    Payment code field: {tx.payment_code!r}")
             return {"success": True, "message": "No payment code found"}
-        print(f"  [PAYMENT CODE] {payment_code}")
 
-        # Mã CK DHxxxxxxx map ngược sang order_code bằng cách tìm trong DB qua payment_link_id.
-        order = await db.get_order_by_payment_code(payment_code)
+        # Try each candidate code against DB (exact match first)
+        order = None
+        payment_code = None
+        for candidate in payment_codes:
+            order = await db.get_order_by_payment_code(candidate)
+            if order:
+                payment_code = candidate
+                print(f"  [PAYMENT CODE] Exact match: {candidate}")
+                break
+
+        # Fallback: prefix/fuzzy search for codes with bank-appended digits
         if not order:
-            print(f"  [FAIL] Order not found for payment_code={payment_code}")
+            for candidate in payment_codes:
+                order = await db.get_order_by_payment_code_prefix(candidate)
+                if order:
+                    payment_code = candidate
+                    print(f"  [PAYMENT CODE] Prefix match: {candidate} → payment_link_id={order.get('payment_link_id')}")
+                    break
+
+        if not order or not payment_code:
+            print(f"  [FAIL] Order not found for any payment_code candidate: {payment_codes}")
             return JSONResponse(
-                {"success": False, "message": f"Không tìm thấy đơn với payment_code {payment_code}"},
+                {"success": False, "message": f"Không tìm thấy đơn với payment_code {payment_codes}"},
                 status_code=400,
             )
         print(
@@ -166,7 +184,9 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
             f"total={order['total']}, payment_link_id={order.get('payment_link_id')}"
         )
 
-        reference = tx.transaction_id or tx.reference_code or f"sepay-{payment_code}-{tx.amount}"
+        # CRITICAL FIX: Improve reference uniqueness by adding timestamp
+        import time
+        reference = tx.transaction_id or tx.reference_code or f"sepay-{payment_code}-{tx.amount}-{int(time.time())}"
         print(f"  [MARK PAID] order_code={order['order_code']}, amount={tx.amount}, reference={reference}")
         changed, message, paid_order = await db.mark_order_paid(
             order_code=int(order["order_code"]),
@@ -202,7 +222,7 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
         except Exception as exc:
             print(f"  [PROFILE] Failed to create profile for user {paid_order['user_id']}: {exc}")
 
-        # FIX: Wrap Telegram sends in try/except so a Telegram API error
+        # CRITICAL FIX: Wrap Telegram sends in try/except so a Telegram API error
         # doesn't cause 500 → SePay retry → double processing.
         try:
             await bot.send_message(
@@ -212,6 +232,7 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
             print(f"  [TELEGRAM] Delivery message sent to user {paid_order['user_id']}")
         except Exception as exc:
             print(f"  [TELEGRAM ERROR] Failed to send delivery to user {paid_order['user_id']}: {exc}")
+            # CRITICAL: Continue processing, do not raise exception
 
         for admin_id in settings.admin_ids:
             try:
@@ -228,6 +249,7 @@ def create_web_app(bot: Bot, db: Database, sepay: SePayClient, settings: Setting
                 )
             except Exception as exc:
                 print(f"  [TELEGRAM ERROR] Failed to notify admin {admin_id}: {exc}")
+                # CRITICAL: Continue to next admin, do not raise exception
 
         print(f"  [DONE] Order {paid_order['order_code']} fully processed!")
         print("=" * 60)
