@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 from typing import Any
@@ -245,6 +246,36 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
                 )
             except Exception:
                 pass
+        
+        # ── Animated welcome ──
+        name = message.from_user.first_name or "bạn"
+        frames = [
+            "⚡",
+            "⚡ Đang tải",
+            "⚡ Đang tải.",
+            "⚡ Đang tải..",
+            "⚡ Đang tải...",
+            f"👋 Xin chào <b>{html_escape(name)}</b>!",
+        ]
+        anim_msg = await message.answer(frames[0])
+        for frame in frames[1:]:
+            await asyncio.sleep(0.3)
+            try:
+                await anim_msg.edit_text(frame)
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
+        try:
+            await anim_msg.edit_text(
+                f"🎉 Chào mừng <b>{html_escape(name)}</b> đến với shop!\n\n"
+                "━━━━━━━━━━━━━━━━━━━\n"
+                "🛍 Sản phẩm chất lượng\n"
+                "⚡ Giao hàng tự động\n"
+                "🔒 Bảo hành đổi trả\n"
+                "━━━━━━━━━━━━━━━━━━━"
+            )
+        except Exception:
+            pass
         
         await message.answer("📌 Đã bật menu nhanh dưới ô chat.", reply_markup=main_menu_keyboard())
         await message.answer(render_start_text(), reply_markup=start_keyboard())
@@ -1219,6 +1250,26 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             await db.clear_cart(callback.from_user.id)
             
             from app.web_app import build_delivery_message
+            
+            # ── Payment processing animation ──
+            processing_msg = await callback.message.answer("⏳ Đang xử lý thanh toán...")
+            anim_frames = ["⏳ Đang xử lý thanh toán.", "⏳ Đang xử lý thanh toán..", "⏳ Đang xử lý thanh toán..."]
+            for frame in anim_frames:
+                await asyncio.sleep(0.4)
+                try:
+                    await processing_msg.edit_text(frame)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
+            try:
+                await processing_msg.edit_text(
+                    "🎉🎊 <b>Thanh toán thành công!</b> 🎊🎉\n\n"
+                    f"💰 Đã trừ <b>{money_vnd(total)}</b> từ ví\n"
+                    f"👛 Còn lại: <b>{money_vnd(new_balance)}</b>"
+                )
+            except Exception:
+                pass
+            
             await callback.message.answer(build_delivery_message(paid_order))
             await callback.message.answer(
                 f"👛 Số dư ví còn lại: <b>{money_vnd(new_balance)}</b>",
@@ -1527,7 +1578,26 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         action = callback.data.split(":", 1)[1]
 
         if action in ("today", "week", "month"):
+            # ── Stats loading animation ──
+            bar_frames = [
+                "📊 Đang tải thống kê...\n▓░░░░░░░░░ 10%",
+                "📊 Đang tải thống kê...\n▓▓▓░░░░░░░ 30%",
+                "📊 Đang tải thống kê...\n▓▓▓▓▓▓░░░░ 60%",
+                "📊 Đang tải thống kê...\n▓▓▓▓▓▓▓▓▓░ 90%",
+            ]
+            loading_msg = await callback.message.answer(bar_frames[0])
+            for frame in bar_frames[1:]:
+                await asyncio.sleep(0.3)
+                try:
+                    await loading_msg.edit_text(frame)
+                except Exception:
+                    pass
             stats = await db.get_revenue_stats(action)
+            await asyncio.sleep(0.2)
+            try:
+                await loading_msg.delete()
+            except Exception:
+                pass
             period_labels = {"today": "Hôm nay", "week": "Tuần này", "month": "Tháng này"}
             await callback.message.answer(
                 f"📊 <b>Thống kê {period_labels[action]}</b>\n\n"
