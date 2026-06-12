@@ -24,20 +24,7 @@ def build_delivery_message(order: dict) -> str:
     for item in order["items"]:
         lines.append(f"\n<b>{html_escape(item['name'])}</b> x{item['qty']}")
         delivery = item.get("delivery_text") or "Shop sẽ liên hệ để giao hàng."
-        # Split by | to make each part copyable separately
-        parts = delivery.split("|")
-        if len(parts) >= 2:
-            # Account format: email|password|token...
-            labels = ["📧 Email", "🔑 Mật khẩu", "🔐 Token", "🆔 ID"]
-            for i, part in enumerate(parts):
-                part = part.strip()
-                if not part:
-                    continue
-                label = labels[i] if i < len(labels) else f"#{i+1}"
-                lines.append(f"{label}:\n<code>{html_escape(part)}</code>")
-        else:
-            lines.append(f"<code>{html_escape(delivery)}</code>")
-    lines.append("\n💡 <i>Nhấn vào từng dòng để copy riêng.</i>")
+        lines.append(f"<code>{html_escape(delivery)}</code>")
     return "\n".join(lines)
 
 
