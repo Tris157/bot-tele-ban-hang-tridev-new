@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import random
 import time
 from typing import Any
 
@@ -69,12 +68,12 @@ def render_shop_text(username: str | None) -> str:
     return f"Chào bạn đã đến với cửa hàng của {html_escape(name)}, hôm nay bạn muốn mua gì ^^"
 
 
-def render_product_text(product: dict[str, Any]) -> str:
+def render_product_text(product: dict[str, Any], sold_count: int = 0) -> str:
     return (
         f"📧 <b>{html_escape(product['name'])}</b>\n"
         f"💵 Giá: <b>{money_vnd(int(product['price']))}</b>\n"
         f"➕ Tồn kho: <b>{product['stock']} tài khoản</b>\n"
-        f"📊 Đã bán: <b>{random.randint(12, 98)} tài khoản</b>\n\n"
+        f"📊 Đã bán: <b>{sold_count} tài khoản</b>\n\n"
         "💬 <b>Mô tả:</b>\n"
         f"{html_escape(product.get('description'))}"
     )
@@ -159,8 +158,15 @@ async def send_shop(message: Message, db: Database) -> None:
     )
 
 
-async def send_product(message: Message, product: dict[str, Any]) -> None:
-    text = render_product_text(product)
+async def send_product(message: Message, product: dict[str, Any], db: Database | None = None) -> None:
+    sold_count = 0
+    if db:
+        try:
+            counts = await db.get_product_account_counts(product["id"])
+            sold_count = counts.get("sold", 0)
+        except Exception:
+            pass
+    text = render_product_text(product, sold_count=sold_count)
     markup = product_keyboard(product["id"], stock=int(product.get("stock", 0)))
     image_url = (product.get("image_url") or "").strip()
     if image_url:
@@ -170,6 +176,39 @@ async def send_product(message: Message, product: dict[str, Any]) -> None:
         except Exception:
             pass
     await message.answer(text, reply_markup=markup)
+
+
+async def notify_stock_waiters(bot: Any, db: Database, product_id: str) -> tuple[int, int]:
+    product = await db.get_product(product_id)
+    if not product or int(product.get("stock", 0)) <= 0:
+        return 0, 0
+
+    waiters = await db.pop_stock_waiters(product_id)
+    if not waiters:
+        return 0, 0
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Xem san pham", callback_data=f"view:{product_id}")
+    kb.button(text="Mua ngay", callback_data=f"buy:{product_id}")
+    kb.adjust(1)
+
+    text = (
+        "San pham ban dang cho da co hang lai.\n\n"
+        f"San pham: <b>{html_escape(product['name'])}</b>\n"
+        f"Gia: <b>{money_vnd(int(product['price']))}</b>\n"
+        f"Kho hien tai: <b>{int(product['stock'])}</b>\n\n"
+        "Bam nut ben duoi de mua."
+    )
+
+    sent = 0
+    failed = 0
+    for waiter in waiters:
+        try:
+            await bot.send_message(int(waiter["user_id"]), text, reply_markup=kb.as_markup())
+            sent += 1
+        except Exception:
+            failed += 1
+    return sent, failed
 
 
 def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings: Settings) -> None:
@@ -317,6 +356,9 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         product_id = parts[1].strip()
         account_texts = parts[2].splitlines()
         added, result = await db.add_product_accounts(product_id, account_texts)
+        notified, notify_failed = (0, 0)
+        if added > 0:
+            notified, notify_failed = await notify_stock_waiters(message.bot, db, product_id)
         await message.answer(
             f"🔐 <b>{html_escape(result)}</b>\n"
             f"Sản phẩm: <code>{html_escape(product_id)}</code>\n"
@@ -976,8 +1018,23 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         if not product:
             await callback.answer("Sản phẩm không tồn tại.", show_alert=True)
             return
-        await send_product(callback.message, product)
+        await send_product(callback.message, product, db)
         await callback.answer()
+
+    @router.callback_query(F.data.startswith("waitstock:"))
+    async def wait_stock(callback: CallbackQuery):
+        product_id = callback.data.split(":", 1)[1]
+        ok, message_text = await db.add_stock_waiter(
+            product_id=product_id,
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+        )
+        await callback.answer(message_text, show_alert=True)
+        if ok:
+            await callback.message.answer(
+                "Da ghi nhan. Khi san pham co hang lai, bot se nhan tin cho ban.",
+                reply_markup=main_menu_keyboard(),
+            )
 
     @router.callback_query(F.data == "mainmenu")
     async def mainmenu_callback(callback: CallbackQuery):
@@ -1024,6 +1081,9 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
 
         account_texts = (message.text or "").splitlines()
         added, result = await db.add_product_accounts(product_id, account_texts)
+        notified, notify_failed = (0, 0)
+        if added > 0:
+            notified, notify_failed = await notify_stock_waiters(message.bot, db, product_id)
         pending_admin_add_accounts.pop(message.from_user.id, None)
         inventory = await db.get_product_account_counts(product_id)
         await message.answer(
@@ -1042,6 +1102,10 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
         product = await db.get_product(product_id)
         if not product:
             await callback.answer("Sản phẩm không tồn tại.", show_alert=True)
+            return
+        if int(product.get("stock", 0)) <= 0:
+            await callback.answer("San pham dang het hang. Bam 'Nhac toi khi co hang' de duoc bao lai.", show_alert=True)
+            await send_product(callback.message, product, db)
             return
         pending_products[callback.from_user.id] = product_id
         await callback.message.answer(
@@ -1205,6 +1269,7 @@ def register_handlers(dp: Dispatcher, db: Database, sepay: SePayClient, settings
             username=callback.from_user.username,
             items=[item],
             total=total,
+            expires_in_minutes=settings.order_expire_minutes,
         )
 
         try:

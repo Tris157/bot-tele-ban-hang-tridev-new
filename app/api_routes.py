@@ -541,6 +541,7 @@ def create_api_router(bot: Bot, db: Database, sepay: SePayClient, settings: Sett
             username=user.get("username"),
             items=[deposit_item],
             total=amount,
+            expires_in_minutes=10,
         )
 
         try:

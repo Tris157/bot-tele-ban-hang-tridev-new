@@ -34,6 +34,7 @@ class Settings:
     web_host: str
     web_port: int
     database_path: str
+    order_expire_minutes: int
 
     @property
     def webhook_url(self) -> str:
@@ -65,4 +66,5 @@ def get_settings() -> Settings:
         web_host=os.getenv("WEB_HOST", "0.0.0.0").strip(),
         web_port=int(os.getenv("WEB_PORT", "8000")),
         database_path=os.getenv("DATABASE_PATH", "shop.db").strip(),
+        order_expire_minutes=int(os.getenv("ORDER_EXPIRE_MINUTES", "5")),
     )

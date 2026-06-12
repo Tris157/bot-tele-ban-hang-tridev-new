@@ -218,3 +218,24 @@ def admin_wallet_customers_keyboard(customers: list[dict]) -> InlineKeyboardMark
     kb.button(text="⬅️ Về admin", callback_data="admin:home")
     kb.adjust(1)
     return kb.as_markup()
+
+
+# Override the earlier product keyboard with an out-of-stock waitlist action.
+def product_keyboard(product_id: str, stock: int = 0) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if stock > 0:
+        kb.button(text="Mua san pham nay", callback_data=f"buy:{product_id}")
+    else:
+        kb.button(text="Nhac toi khi co hang", callback_data=f"waitstock:{product_id}")
+    quick_qtys = [q for q in [1, 3, 5, 10] if q <= stock]
+    for q in quick_qtys:
+        kb.button(text=f"Mua {q}x", callback_data=f"quickbuy:{product_id}:{q}")
+    kb.button(text="Quay lai san pham", callback_data="shop")
+    kb.button(text="Menu chinh", callback_data="mainmenu")
+    if stock <= 0:
+        kb.adjust(1, 2)
+    elif quick_qtys:
+        kb.adjust(1, len(quick_qtys), 2)
+    else:
+        kb.adjust(1, 2)
+    return kb.as_markup()

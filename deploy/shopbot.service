@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Shop Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/bot-tele-ban-hang-tridev-new
+ExecStart=/root/bot-tele-ban-hang-tridev-new/venv/bin/python -m app.main
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
